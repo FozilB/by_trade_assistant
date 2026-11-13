@@ -1,0 +1,680 @@
+"""Помощник по сделкам OKX в Telegram.
+
+Вы сообщаете о входе (форма в Telegram или команда /in), бот отвечает планом:
+стоп по графику, цели, суммы в долларах, ликвидация, предупреждения.
+Потом сопровождает сделку до закрытия: безубыток на 1R, цель 1 (закрыть 50%), цель 2,
+стоп по новым максимумам/минимумам 1ч, Hammer/Star против сделки, перепроданность, открытие биржи у токенов акций.
+
+Один запуск держит связь с Telegram RUN_SECONDS секунд (около 4.5 минут), затем начинается следующий —
+поэтому ответы приходят за секунды. Запуски идут цепочкой из GitHub Actions.
+
+Команды:
+  /in aero short 0.553 x20 10 [стоп 0.57]   — я вошёл (монета, шорт/лонг, вход, плечо, маржа $)
+  /analyze aero  (или просто: aero)         — разбор монеты без входа
+  /status                                   — все открытые сделки
+  /stop aero 0.56                           — изменить стоп
+  /out aero [цена]                          — закрыть сопровождение
+  /menu                                     — кнопки и форма
+"""
+import json
+import os
+import re
+import sys
+import time
+
+import requests
+
+import assistant_config as A
+import shortsetup as S
+
+C = S.C
+H1, M15, M1 = S.H1, S.M15, 60_000
+STATE_FILE = os.environ.get("STATE_FILE", "state/assistant.json")
+TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+CHAT = str(os.environ.get("TELEGRAM_CHAT_ID", ""))
+log = S.log
+price = S.price
+
+
+def now_ms():
+    return int(time.time() * 1000)
+
+
+def webapp_url():
+    if os.environ.get("WEBAPP_URL"):
+        return os.environ["WEBAPP_URL"]
+    repo = os.environ.get("GITHUB_REPOSITORY", "FozilB/by_trade_assistant")
+    owner, name = repo.split("/", 1)
+    return f"https://{owner.lower()}.github.io/{name}/"
+
+
+# ================================================================ Telegram
+
+def tg(method, payload, timeout=30):
+    try:
+        r = requests.post(f"https://api.telegram.org/bot{TOKEN}/{method}", json=payload, timeout=timeout + 10)
+        j = r.json()
+    except (requests.RequestException, ValueError) as e:
+        log(f"  Telegram {method}: ошибка {e}")
+        return None
+    if not j.get("ok"):
+        log(f"  Telegram {method}: {j.get('error_code')} {j.get('description')}")
+        return None
+    return j.get("result")
+
+
+def say(text, markup=None):
+    p = {"chat_id": CHAT, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
+    if markup:
+        p["reply_markup"] = markup
+    return tg("sendMessage", p) is not None
+
+
+def menu_markup():
+    return {"keyboard": [[{"text": "➕ Новая сделка / анализ", "web_app": {"url": webapp_url()}}],
+                         [{"text": "📊 Статус"}, {"text": "❓ Помощь"}]],
+            "resize_keyboard": True, "is_persistent": True}
+
+
+def pos_markup(inst):
+    b = S.base_of(inst)
+    return {"inline_keyboard": [[{"text": "📊 Статус", "callback_data": f"st:{b}"},
+                                 {"text": "🛑 Стоп", "callback_data": f"sl:{b}"},
+                                 {"text": "✅ Закрыть", "callback_data": f"out:{b}"}]]}
+
+
+HELP = ("🤖 <b>Помощник по сделкам</b>\n\n"
+        "<b>➕ Новая сделка / анализ</b> — кнопка внизу открывает форму.\n\n"
+        "Или командами:\n"
+        "<code>/in aero short 0.553 x20 10</code> — вошёл: монета, шорт/лонг, вход, плечо, маржа $\n"
+        "   можно добавить свой стоп: <code>стоп 0.57</code>\n"
+        "<code>aero</code> или <code>/analyze aero</code> — разбор монеты\n"
+        "<code>/status</code> — открытые сделки\n"
+        "<code>/stop aero 0.56</code> — изменить стоп\n"
+        "<code>/out aero</code> — закрыть сопровождение\n\n"
+        "Числа можно писать с запятой. Ответ обычно за несколько секунд; "
+        "раз в ~5 минут бывает пауза до минуты, пока перезапускается бот.")
+
+
+# ================================================================ Разбор ввода
+
+def num(s):
+    s = str(s).strip().replace(",", ".").replace("ю", ".").replace("б", ".")
+    return float(s)
+
+
+def norm_inst(sym):
+    s = sym.strip().upper().replace("/", "").replace(" ", "")
+    for suf in (".P", "-USDT-SWAP", "-SWAP", "-USDT", "USDT"):
+        if s.endswith(suf):
+            s = s[: -len(suf)]
+    s = s.rstrip("-")
+    if not re.fullmatch(r"[A-Z0-9]{1,20}", s):
+        raise ValueError(f"не понял монету «{sym}»")
+    return f"{s}-USDT-SWAP"
+
+
+SIDE = {"short": "short", "шорт": "short", "s": "short", "sell": "short", "ш": "short",
+        "long": "long", "лонг": "long", "l": "long", "buy": "long", "л": "long"}
+
+
+def parse_in(args):
+    """/in aero short 0.553 x20 10 [стоп 0.57] -> dict. Порядок после монеты почти любой."""
+    if not args:
+        raise ValueError("нужно: /in монета шорт/лонг вход x плечо маржа")
+    out = {"sym": args[0], "side": None, "entry": None, "lev": None, "margin": None, "stop": None}
+    rest, i = args[1:], 0
+    plain = []
+    while i < len(rest):
+        t = rest[i].lower()
+        if t in SIDE:
+            out["side"] = SIDE[t]
+        elif t in ("стоп", "stop", "sl", "с"):
+            out["stop"] = num(rest[i + 1])
+            i += 1
+        elif re.fullmatch(r"[xх×]\d+([.,]\d+)?|\d+([.,]\d+)?[xх×]", t):
+            out["lev"] = num(t.strip("xх×"))
+        elif t.startswith("$") or t.endswith("$"):
+            out["margin"] = num(t.strip("$"))
+        else:
+            plain.append(num(t))
+        i += 1
+    if plain:
+        out["entry"] = plain[0]
+    if len(plain) > 1 and out["margin"] is None:
+        out["margin"] = plain[1]
+    out["side"] = out["side"] or "short"
+    if not out["entry"] or out["entry"] <= 0:
+        raise ValueError("не вижу цену входа")
+    return out
+
+
+# ================================================================ Данные и расчёт
+
+def load_market(inst):
+    cs4 = S.fetch_candles(inst, "4H", 150)
+    cs1 = S.fetch_candles(inst, "1H", 120)
+    cs15 = S.fetch_candles(inst, "15m", 100)
+    if not cs4 or not cs1 or not cs15:
+        raise ValueError(f"OKX не отдал свечи {inst} — проверьте название монеты")
+    return {"c4": [x for x in cs4 if x["closed"]], "c1": [x for x in cs1 if x["closed"]],
+            "c15": [x for x in cs15 if x["closed"]], "px": cs15[-1]["c"], "c1_all": cs1}
+
+
+def chart_stop(side, entry, c15):
+    a15 = S.atr(c15) or entry * 0.003
+    win = c15[-A.STOP_PIVOT_BARS_15M:]
+    highs, lows = S.pivots(win, 2)
+    buf = A.STOP_BUFFER_ATR15 * a15
+    if side == "short":
+        cands = [p for _, p in highs if p > entry + 0.3 * a15]
+        base = min(cands) if cands else max(x["h"] for x in c15[-16:])
+        recent = max(x["h"] for x in c15[-4:])
+        base = max(base, recent)
+        stop = max(base + buf, entry + A.MIN_STOP_ATR15 * a15)
+    else:
+        cands = [p for _, p in lows if p < entry - 0.3 * a15]
+        base = max(cands) if cands else min(x["l"] for x in c15[-16:])
+        recent = min(x["l"] for x in c15[-4:])
+        base = min(base, recent)
+        stop = min(base - buf, entry - A.MIN_STOP_ATR15 * a15)
+    return stop, a15
+
+
+def levels(side, entry, m):
+    """Поддержки (для шорта, ниже входа) или сопротивления (для лонга, выше) по 1ч и 4ч, от ближних к дальним."""
+    h1, l1 = S.pivots(m["c1"][-120:], 3)
+    h4, l4 = S.pivots(m["c4"][-100:], 3)
+    if side == "short":
+        return sorted({p for _, p in l1 + l4 if p < entry}, reverse=True)
+    return sorted({p for _, p in h1 + h4 if p > entry})
+
+
+def targets(side, entry, r, m):
+    a1 = S.atr(m["c1"]) or r
+    sgn = -1 if side == "short" else 1
+    lv = [x for x in levels(side, entry, m) if abs(x - entry) >= A.TARGET_MIN_R * r]
+    off = -sgn * 0.1 * a1  # цель чуть раньше уровня
+    if lv:
+        t1, note = lv[0] + off, "уровень " + price(lv[0])
+        more = [x for x in lv[1:] if abs(x - entry) >= abs(t1 - entry) + 0.5 * r]
+        t2 = more[0] + off if more else entry + sgn * max(A.FALLBACK_T2_R * r, 1.6 * abs(t1 - entry))
+    else:
+        t1, note = entry + sgn * A.FALLBACK_T1_R * r, f"уровня нет, {A.FALLBACK_T1_R:g}R"
+        t2 = entry + sgn * A.FALLBACK_T2_R * r
+    return t1, t2, note
+
+
+def liq_price(side, entry, lev):
+    if not lev:
+        return None
+    mm = A.MAINT_MARGIN_PCT / 100
+    return entry * (1 + 1 / lev - mm) if side == "short" else entry * (1 - 1 / lev + mm)
+
+
+def warnings(inst, side, entry, stop, r, liq, m):
+    w = []
+    sgn = 1 if side == "short" else -1
+    if liq is not None and (liq - stop) * sgn <= 0:
+        dist = abs(stop - entry) / entry
+        safe = int(1 / (dist + A.MAINT_MARGIN_PCT / 100 + 0.005))
+        w.append(f"🚨 Ликвидация {price(liq)} <b>раньше стопа</b>! Плечо не выше x{max(safe, 1)}.")
+    c1, c15 = m["c1"], m["c15"]
+    if side == "short":
+        if any(S.is_hammer(c1, len(c1) - 1 - j) for j in range(3)) or any(S.is_hammer(c15, len(c15) - 1 - j) for j in range(4)):
+            w.append("⚠️ Свежий Hammer — возможен отскок вверх.")
+    else:
+        if any(S.is_star(c1, len(c1) - 1 - j, 10) for j in range(3)) or any(S.is_star(c15, len(c15) - 1 - j, 10) for j in range(4)):
+            w.append("⚠️ Свежая Star — возможен откат вниз.")
+    rsi15 = S.rsi_series([x["c"] for x in c15])[-1]
+    if rsi15 is not None and ((side == "short" and rsi15 <= 30) or (side == "long" and rsi15 >= 70)):
+        w.append(f"⚠️ RSI(15м) {rsi15:.0f} — {'перепроданность' if side == 'short' else 'перекупленность'}, вход у края движения.")
+    lv = levels(side, entry, m)
+    if lv and abs(lv[0] - entry) < r:
+        w.append(f"⚠️ {'Поддержка' if side == 'short' else 'Сопротивление'} {price(lv[0])} ближе 1R — места мало.")
+    day = c1[-24:]
+    if day:
+        if side == "short":
+            moved = (max(x["h"] for x in day) - entry) / max(x["h"] for x in day) * 100
+        else:
+            moved = (entry - min(x["l"] for x in day)) / min(x["l"] for x in day) * 100
+        if moved > A.CHASE_PCT:
+            w.append(f"⚠️ Цена уже прошла {moved:.1f}% за сутки в вашу сторону — вход вдогонку.")
+    sma = S.sma_last([x["c"] for x in m["c4"]], 50)
+    if sma and ((side == "short" and entry > sma) or (side == "long" and entry < sma)):
+        w.append(f"⚠️ Против тренда 4ч: цена {'выше' if side == 'short' else 'ниже'} MA50 ({price(sma)}).")
+    block = S.stock_block(inst, now_ms(), 60)
+    if block:
+        w.append(f"⚠️ Скоро {block} — возможен гэп.")
+    return w
+
+
+def make_plan(inst, side, entry, lev, margin, user_stop, m):
+    stop_c, a15 = chart_stop(side, entry, m["c15"])
+    notes = []
+    if user_stop:
+        if (user_stop - entry) * (1 if side == "short" else -1) <= 0:
+            raise ValueError(f"стоп {price(user_stop)} не с той стороны от входа")
+        stop = user_stop
+        if abs(user_stop - entry) < A.MIN_STOP_ATR15 * a15:
+            notes.append(f"⚠️ Ваш стоп ближе обычного шума (1 ATR 15м = {abs(a15 / entry * 100):.2f}%). "
+                         f"По графику: {price(stop_c)}.")
+    else:
+        stop = stop_c
+    r = abs(stop - entry)
+    t1, t2, t1_note = targets(side, entry, r, m)
+    notional = lev * margin if lev and margin else None
+    qty = notional / entry if notional else None
+    liq = liq_price(side, entry, lev)
+    return {"inst": inst, "side": side, "entry": entry, "lev": lev, "margin": margin, "stop": stop, "stop0": stop,
+            "r0": r, "t1": t1, "t2": t2, "t1_note": t1_note, "qty": qty, "notional": notional, "liq": liq,
+            "warn": notes + warnings(inst, side, entry, stop, r, liq, m), "stop_chart": stop_c, "user_stop": bool(user_stop)}
+
+
+def usd(x):
+    return f"{'+' if x >= 0 else '−'}${abs(x):.2f}"
+
+
+def fmt_plan(p, m=None):
+    side, e = p["side"], p["entry"]
+    b = S.base_of(p["inst"])
+    arrow = "🔻 SHORT" if side == "short" else "🟢 LONG"
+    head = f"{arrow} <b>{b}</b> · вход {price(e)}"
+    if p["lev"] and p["margin"]:
+        head += f" · x{p['lev']:g} · маржа ${p['margin']:g} · позиция ${p['notional']:.0f}"
+    lines = [head, ""]
+    q = p["qty"]
+    loss = f" → {usd(-q * p['r0'])} ({q * p['r0'] / p['margin'] * 100:.0f}% маржи)" if q else ""
+    src = "ваш" if p["user_stop"] else "по графику, за ближайшим уровнем 15м"
+    lines.append(f"🛑 <b>Стоп: {price(p['stop'])}</b> ({S.pct(p['stop'], e):+.2f}%, {src}){loss}")
+    half = A.TAKE_AT_T1_PCT / 100
+    g1 = f" → {usd(q * abs(e - p['t1']) * half)} за {A.TAKE_AT_T1_PCT}%" if q else ""
+    g2 = f" → ещё {usd(q * abs(e - p['t2']) * (1 - half))}" if q else ""
+    lines.append(f"🎯 <b>Цель 1: {price(p['t1'])}</b> ({S.pct(p['t1'], e):+.2f}%, {p['t1_note']}){g1}")
+    lines.append(f"🎯 <b>Цель 2: {price(p['t2'])}</b> ({S.pct(p['t2'], e):+.2f}%){g2}")
+    lines.append(f"Риск/прибыль до цели 1: 1 к {abs(p['t1'] - e) / p['r0']:.1f}")
+    if p["liq"]:
+        ok = (p["liq"] - p["stop"]) * (1 if side == "short" else -1) > 0
+        lines.append(f"Ликвидация ≈ {price(p['liq'])} {'✅ дальше стопа' if ok else '🚨 РАНЬШЕ СТОПА'}")
+    if m is not None and side == "short":
+        kind, d = S.detect(m["c4"], m["c1"], e, m["c15"])
+        lines.append("✅ Совпадает с сетапом сканера." if kind == "signal" else f"Сетап сканера: {d if kind is None else 'наблюдение, свечи-отказа ещё нет'}.")
+    if p["warn"]:
+        lines += [""] + p["warn"]
+    lines += ["", "Сопровождаю: безубыток на 1R, цель 1 — закрыть 50%, дальше стоп по структуре 1ч."]
+    return "\n".join(lines)
+
+
+def analyze(inst):
+    m = load_market(inst)
+    px = m["px"]
+    b = S.base_of(inst)
+    c4, c1 = m["c4"], m["c1"]
+    sma = S.sma_last([x["c"] for x in c4], 50)
+    h4, l4 = S.pivots(c4[-100:], 3)
+    rsi1 = S.rsi_series([x["c"] for x in c1])[-1]
+    rsi4 = S.rsi_series([x["c"] for x in c4])[-1]
+    hh = [p for _, p in h4[-3:]]
+    if len(hh) >= 2:
+        trend = "вниз (максимумы снижаются)" if hh[-1] < hh[-2] else "вверх (максимумы растут)"
+    else:
+        trend = "не определён"
+    res = sorted({p for _, p in S.pivots(c1[-120:], 3)[0] + h4 if p > px})[:2]
+    sup = levels("short", px, m)[:2]
+    lines = [f"🔍 <b>{b}</b> · цена {price(px)}", "",
+             f"4ч: тренд {trend}, цена {'ниже' if sma and px < sma else 'выше'} MA50 ({price(sma) if sma else '—'})",
+             f"RSI: 1ч {rsi1:.0f} · 4ч {rsi4:.0f}" if rsi1 and rsi4 else "RSI: —",
+             "Сопротивления выше: " + (", ".join(price(x) for x in res) or "нет"),
+             "Поддержки ниже: " + (", ".join(price(x) for x in sup) or "нет")]
+    if any(S.is_hammer(c1, len(c1) - 1 - j) for j in range(3)):
+        lines.append("⚠️ Свежий Hammer на 1ч")
+    if any(S.is_star(c1, len(c1) - 1 - j, 10) for j in range(3)):
+        lines.append("🌠 Свежая Star на 1ч")
+    kind, d = S.detect(c4, c1, px, m["c15"])
+    if kind == "signal":
+        lines += ["", "✅ <b>Сейчас есть сетап «шорт от нижнего максимума»</b>"]
+    elif kind == "watch":
+        lines += ["", f"👀 Цена у сопротивления {price(d['level'][1])} — ждать свечу-отказ на 1ч"]
+    else:
+        lines += ["", f"Сетапа для шорта нет: {d}"]
+    p = make_plan(inst, "short", px, None, None, None, m)
+    lines += ["", f"Если шорт отсюда: стоп {price(p['stop'])} ({S.pct(p['stop'], px):+.2f}%), "
+                  f"цель 1 {price(p['t1'])} ({S.pct(p['t1'], px):+.2f}%), 1 к {abs(p['t1'] - px) / p['r0']:.1f}",
+              f"<a href=\"{S.chart_link(inst)}\">График TradingView</a>"]
+    return "\n".join(lines)
+
+
+# ================================================================ Позиции
+
+def pnl(pos, px):
+    sgn = 1 if pos["side"] == "short" else -1
+    move = (pos["entry"] - px) * sgn
+    left = 1 - (A.TAKE_AT_T1_PCT / 100 if pos.get("t1_hit") else 0)
+    usd_open = pos["qty"] * move * left if pos.get("qty") else None
+    return move / pos["r0"], usd_open
+
+
+def fmt_status(pos, px):
+    r, u = pnl(pos, px)
+    b = S.base_of(pos["inst"])
+    flags = []
+    if pos.get("be"):
+        flags.append("безубыток")
+    if pos.get("t1_hit"):
+        flags.append(f"цель 1 взята ({usd(pos.get('banked', 0))})")
+    s = (f"{'🔻' if pos['side'] == 'short' else '🟢'} <b>{b}</b> · цена {price(px)} · {r:+.2f}R"
+         + (f" · {usd(u)}" if u is not None else "") + "\n"
+         f"вход {price(pos['entry'])} · стоп {price(pos['stop'])} · цели {price(pos['t1'])} / {price(pos['t2'])}")
+    return s + (f"\n{', '.join(flags)}" if flags else "")
+
+
+def last_price(inst):
+    cs = S.fetch_candles(inst, "1m", 1)
+    return cs[-1]["c"] if cs else None
+
+
+def close_pos(state, inst, px, why):
+    pos = state["pos"].pop(inst)
+    r, u = pnl(pos, px) if px else (None, None)
+    total = (u or 0) + pos.get("banked", 0)
+    txt = f"✅ <b>{S.base_of(inst)}</b> · сопровождение закрыто ({why})"
+    if px:
+        txt += f" по {price(px)}"
+        if pos.get("qty"):
+            txt += f"\nИтог сделки ≈ {usd(total)}"
+    say(txt)
+
+
+def track(state, inst, now):
+    """Проверка одной позиции по свечам с прошлой проверки. Возвращает False, если позиция закрыта."""
+    pos = state["pos"][inst]
+    b = S.base_of(inst)
+    short = pos["side"] == "short"
+    gap_min = (now - pos["checked"]) / M1
+    bar, ms = ("1m", M1) if gap_min <= 290 else ("15m", M15)
+    cs = S.fetch_candles(inst, bar, int(min(300, gap_min * M1 / ms + 3)))
+    if not cs:
+        return True
+    q = pos.get("qty")
+    half = A.TAKE_AT_T1_PCT / 100
+    for x in cs:
+        if x["ts"] + ms <= pos["checked"]:
+            continue
+        hit_stop = x["h"] >= pos["stop"] if short else x["l"] <= pos["stop"]
+        best = x["l"] if short else x["h"]
+        if hit_stop:
+            if pos.get("be") or pos.get("t1_hit"):
+                close_pos(state, inst, pos["stop"], f"стоп {price(pos['stop'])} задет, он был в безубытке или выше")
+            else:
+                close_pos(state, inst, pos["stop"], f"🛑 стоп {price(pos['stop'])} задет — по плану, без сожалений")
+            return False
+        reached = lambda lvl: best <= lvl if short else best >= lvl  # noqa: E731
+        if not pos.get("be") and reached(pos["entry"] - (1 if short else -1) * A.BREAKEVEN_AT_R * pos["r0"]):
+            pos["be"] = True
+            pos["stop"] = pos["entry"]
+            say(f"🔒 <b>{b}</b> · прошли {A.BREAKEVEN_AT_R:g}R. Перенесите стоп в безубыток: <b>{price(pos['entry'])}</b>.\n"
+                f"Теперь сделка бесплатная — убытка уже не будет.", pos_markup(inst))
+        if not pos.get("t1_hit") and reached(pos["t1"]):
+            pos["t1_hit"] = True
+            pos["banked"] = q * abs(pos["entry"] - pos["t1"]) * half if q else 0
+            if not pos.get("be"):
+                pos["be"], pos["stop"] = True, pos["entry"]
+            say(f"🎯 <b>{b}</b> · цель 1 {price(pos['t1'])}! Закройте {A.TAKE_AT_T1_PCT}%"
+                + (f" ({usd(pos['banked'])})" if q else "") + f", стоп — в безубыток {price(pos['entry'])}.\n"
+                f"Остаток ведём к цели 2 {price(pos['t2'])}.", pos_markup(inst))
+        if pos.get("t1_hit") and reached(pos["t2"]):
+            close_pos(state, inst, pos["t2"], f"🎯🎯 цель 2 {price(pos['t2'])} — закройте остаток")
+            return False
+    px = cs[-1]["c"]
+    near = abs(pos["stop"] - px) <= A.NEAR_STOP_R * pos["r0"] and not pos.get("be")
+    if near and not pos.get("warned_near"):
+        pos["warned_near"] = True
+        say(f"⏳ <b>{b}</b> · цена {price(px)} близко к стопу {price(pos['stop'])}.\n"
+            f"Не двигайте и не закрывайте раньше — стоп стоит за уровнем, это и есть план. Риск известен заранее.")
+    elif abs(pos["stop"] - px) > 0.75 * pos["r0"]:
+        pos["warned_near"] = False
+    pos["checked"] = now
+    if now - pos.get("slow", 0) >= 5 * M1:
+        pos["slow"] = now
+        slow_checks(pos, inst, px, now)
+    return True
+
+
+def slow_checks(pos, inst, px, now):
+    """Раз в ~5 минут: стоп по структуре 1ч, Hammer/Star против сделки, RSI, открытие биржи."""
+    b = S.base_of(inst)
+    short = pos["side"] == "short"
+    cs1 = S.fetch_candles(inst, "1H", 60)
+    if cs1:
+        c1 = [x for x in cs1 if x["closed"]]
+        a1 = S.atr(c1) or pos["r0"]
+        if pos.get("be") and len(c1) > 10:
+            highs, lows = S.pivots(c1, 2)
+            after = [(i, p) for i, p in (highs if short else lows) if c1[i]["ts"] >= pos["opened"]]
+            if after:
+                lvl = after[-1][1]
+                new = lvl + 0.1 * a1 if short else lvl - 0.1 * a1
+                better = (pos["stop"] - new) if short else (new - pos["stop"])
+                beyond = new > px if short else new < px
+                if better >= A.TRAIL_MIN_STEP_R * pos["r0"] and beyond:
+                    pos["stop"] = new
+                    say(f"📉 <b>{b}</b> · новый {'нижний максимум' if short else 'повышающийся минимум'} 1ч {price(lvl)}.\n"
+                        f"Подтяните стоп: <b>{price(new)}</b>.", pos_markup(inst))
+        last = c1[-1] if c1 else None
+        if last and last["ts"] >= pos["opened"] and pos.get("warn_c1") != last["ts"]:
+            i = len(c1) - 1
+            against = S.is_hammer(c1, i) if short else S.is_star(c1, i, 10)
+            if against:
+                pos["warn_c1"] = last["ts"]
+                say(f"⚠️ <b>{b}</b> · на 1ч {'Hammer' if short else 'Star'} против сделки — возможен "
+                    f"{'отскок вверх' if short else 'откат вниз'}. Можно зафиксировать часть или подтянуть стоп.")
+    cs15 = S.fetch_candles(inst, "15m", 40)
+    if cs15:
+        r = S.rsi_series([x["c"] for x in cs15 if x["closed"]])[-1]
+        ext = r is not None and ((short and r <= A.RSI_EXTREME) or (not short and r >= 100 - A.RSI_EXTREME))
+        if ext and now - pos.get("warn_rsi", 0) > 2 * H1:
+            pos["warn_rsi"] = now
+            say(f"⚠️ <b>{b}</b> · RSI(15м) {r:.0f} — {'перепроданность' if short else 'перекупленность'}, "
+                f"возможен отскок. Хороший момент забрать часть прибыли.")
+    block = S.stock_block(inst, now, A.STOCK_WARN_MIN)
+    if block and pos.get("warn_stock") != block + time.strftime("%Y%m%d"):
+        pos["warn_stock"] = block + time.strftime("%Y%m%d")
+        say(f"🔔 <b>{b}</b> · {block}. Возможен резкий гэп — проверьте стоп.")
+
+
+# ================================================================ Команды
+
+def cmd_in(state, d):
+    inst = norm_inst(d["sym"])
+    m = load_market(inst)
+    lev = float(d["lev"]) if d.get("lev") else None
+    margin = float(d["margin"]) if d.get("margin") else None
+    p = make_plan(inst, d["side"], float(d["entry"]), lev, margin, float(d["stop"]) if d.get("stop") else None, m)
+    say(fmt_plan(p, m), pos_markup(inst))
+    now = now_ms()
+    p.update({"opened": now, "checked": now, "slow": now})
+    p.pop("warn", None)
+    state["pos"][inst] = p
+
+
+def find_pos(state, sym):
+    inst = norm_inst(sym)
+    if inst not in state["pos"]:
+        raise ValueError(f"сделки по {S.base_of(inst)} нет. Открытые: "
+                         + (", ".join(S.base_of(k) for k in state["pos"]) or "нет"))
+    return inst
+
+
+def cmd_status(state, only=None):
+    if not state["pos"]:
+        say("Открытых сделок нет. Нажмите «➕ Новая сделка / анализ» или напишите /in.", menu_markup())
+        return
+    for inst, pos in list(state["pos"].items()):
+        if only and inst != only:
+            continue
+        px = last_price(inst)
+        say(fmt_status(pos, px) if px else f"{S.base_of(inst)}: нет цены с OKX", pos_markup(inst))
+
+
+def handle_text(state, text):
+    t = text.strip()
+    if not t:
+        return
+    low = t.lower()
+    if low in ("📊 статус",):
+        return cmd_status(state)
+    if low in ("❓ помощь",):
+        return say(HELP, menu_markup())
+    parts = t.split()
+    cmd, args = parts[0].lower().split("@")[0], parts[1:]
+    if cmd in ("/start", "/menu", "/help", "меню", "помощь"):
+        return say(HELP, menu_markup())
+    if cmd in ("/in", "in", "/вход", "вход"):
+        return cmd_in(state, parse_in(args))
+    if cmd in ("/analyze", "/a", "/анализ", "анализ"):
+        if not args:
+            raise ValueError("какую монету? Например: /analyze aero")
+        return say(analyze(norm_inst(args[0])))
+    if cmd in ("/status", "/s", "статус"):
+        return cmd_status(state, find_pos(state, args[0]) if args else None)
+    if cmd in ("/stop", "/sl", "стоп"):
+        if len(args) < 2:
+            raise ValueError("нужно: /stop монета цена")
+        inst = find_pos(state, args[0])
+        pos = state["pos"][inst]
+        new = num(args[1])
+        if (new - pos["entry"]) * (1 if pos["side"] == "short" else -1) < 0 and not pos.get("be"):
+            raise ValueError("стоп не с той стороны от входа")
+        pos["stop"] = new
+        pos["warned_near"] = False
+        return say(f"🛑 <b>{S.base_of(inst)}</b> · стоп теперь {price(new)}.", pos_markup(inst))
+    if cmd in ("/out", "/close", "закрыть"):
+        if not args:
+            raise ValueError("какую сделку закрыть? /out aero")
+        inst = find_pos(state, args[0])
+        px = num(args[1]) if len(args) > 1 else last_price(inst)
+        return close_pos(state, inst, px, "по вашей команде")
+    if len(parts) == 1 and re.fullmatch(r"[A-Za-z0-9.\-/]{2,25}", t):  # просто название монеты — анализ
+        return say(analyze(norm_inst(t)))
+    say("Не понял команду.\n\n" + HELP, menu_markup())
+
+
+def handle_webapp(state, data):
+    d = json.loads(data)
+    if d.get("mode") == "analyze":
+        return say(analyze(norm_inst(d["sym"])))
+    d = {"sym": d["sym"], "side": d.get("side") or "short", "entry": num(d["entry"]),
+         "lev": num(d["lev"]) if d.get("lev") else None, "margin": num(d["margin"]) if d.get("margin") else None,
+         "stop": num(d["stop"]) if d.get("stop") else None}
+    return cmd_in(state, d)
+
+
+def handle_callback(state, cq):
+    tg("answerCallbackQuery", {"callback_query_id": cq["id"]}, timeout=5)
+    kind, _, sym = (cq.get("data") or "").partition(":")
+    if kind == "st":
+        return cmd_status(state, find_pos(state, sym))
+    if kind == "out":
+        inst = find_pos(state, sym)
+        return close_pos(state, inst, last_price(inst), "по кнопке")
+    if kind == "sl":
+        inst = find_pos(state, sym)
+        return say(f"Напишите новый стоп так: <code>/stop {sym.lower()} ЦЕНА</code>\n"
+                   f"Сейчас: {price(state['pos'][inst]['stop'])}")
+
+
+def handle_update(state, u, fresh_cutoff):
+    msg = u.get("message")
+    cq = u.get("callback_query")
+    if not msg and not cq:
+        return
+    chat = str((msg or {}).get("chat", {}).get("id") or ((cq or {}).get("message") or {}).get("chat", {}).get("id") or "")
+    if chat != CHAT:
+        log(f"  чужой чат {chat} — пропуск")
+        return
+    if msg and msg.get("date", 0) * 1000 < fresh_cutoff:
+        log("  старое сообщение — пропуск")
+        return
+    try:
+        if cq:
+            handle_callback(state, cq)
+        elif msg.get("web_app_data"):
+            handle_webapp(state, msg["web_app_data"]["data"])
+        elif msg.get("text"):
+            handle_text(state, msg["text"])
+    except (ValueError, KeyError, IndexError, TypeError, json.JSONDecodeError) as e:
+        say(f"❗ {e}")
+    except Exception as e:  # noqa: BLE001 — бот не должен падать из-за одной команды
+        log(f"  ошибка: {e!r}")
+        say(f"❗ Внутренняя ошибка: {e}")
+
+
+# ================================================================ Цикл
+
+def load_state():
+    try:
+        with open(STATE_FILE, encoding="utf-8") as f:
+            s = json.load(f)
+    except (OSError, ValueError):
+        s = {}
+    s.setdefault("pos", {})
+    s.setdefault("offset", None)
+    return s
+
+
+def save_state(s):
+    os.makedirs(os.path.dirname(STATE_FILE) or ".", exist_ok=True)
+    with open(STATE_FILE + ".tmp", "w", encoding="utf-8") as f:
+        json.dump(s, f, ensure_ascii=False)
+    os.replace(STATE_FILE + ".tmp", STATE_FILE)
+
+
+def track_all(state):
+    now = now_ms()
+    for inst in list(state["pos"]):
+        try:
+            track(state, inst, now)
+        except Exception as e:  # noqa: BLE001
+            log(f"  сопровождение {inst}: {e!r}")
+
+
+def run(seconds=None):
+    if not TOKEN or not CHAT:
+        log("Нет секретов TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID")
+        sys.exit(1)
+    seconds = A.RUN_SECONDS if seconds is None else seconds
+    state = load_state()
+    t_end = time.time() + seconds
+    fresh_cutoff = now_ms() - A.IGNORE_OLDER_MIN * M1 if state["offset"] is None else 0
+    track_all(state)
+    save_state(state)
+    next_track = time.time() + A.TRACK_EVERY_SEC
+    while time.time() < t_end:
+        wait = int(max(1, min(25, min(t_end, next_track) - time.time())))
+        p = {"timeout": wait, "allowed_updates": ["message", "callback_query"]}
+        if state["offset"] is not None:
+            p["offset"] = state["offset"]
+        ups = tg("getUpdates", p, timeout=wait)
+        if ups is None:
+            time.sleep(3)
+        for u in ups or []:
+            state["offset"] = u["update_id"] + 1
+            handle_update(state, u, fresh_cutoff)
+            save_state(state)
+        if time.time() >= next_track:
+            track_all(state)
+            save_state(state)
+            next_track = time.time() + A.TRACK_EVERY_SEC
+    save_state(state)
+    log(f"Запуск завершён: открытых сделок {len(state['pos'])}")
+
+
+def main():
+    if "--test" in sys.argv or os.environ.get("TEST_TELEGRAM") == "1":
+        ok = say("✅ Помощник на связи. Нажмите кнопку внизу, чтобы открыть форму.\n\n" + HELP, menu_markup())
+        sys.exit(0 if ok else 1)
+    run()
+
+
+if __name__ == "__main__":
+    main()

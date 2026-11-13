@@ -1,0 +1,70 @@
+name: Assistant
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"  # резервный запуск: если цепочка оборвётся, расписание её восстановит
+  workflow_dispatch:
+    inputs:
+      test_telegram:
+        description: "Только отправить приветствие с кнопками в Telegram"
+        type: boolean
+        default: false
+
+# Каждый запуск сразу ставит в очередь следующий, потом ~4.5 минуты отвечает в Telegram и следит за сделками.
+# Следующий начинается, как только закончится текущий (concurrency), — бот почти всё время на связи.
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: assistant
+  cancel-in-progress: false
+
+jobs:
+  assistant:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Восстановить память (открытые сделки)
+        uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: assistant-${{ github.run_id }}
+          restore-keys: assistant-
+
+      - name: Следующий запуск (цепочка)
+        if: ${{ !inputs.test_telegram }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          for attempt in 1 2 3 4 5; do
+            if gh workflow run assistant.yml --ref "${{ github.ref_name }}"; then
+              echo "Следующий запуск поставлен в очередь"; exit 0
+            fi
+            echo "Попытка $attempt не удалась, повтор через 15 с"; sleep 15
+          done
+          echo "Не удалось поставить следующий запуск — цепочку восстановит расписание"
+
+      - name: Помощник
+        run: python assistant.py
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TEST_TELEGRAM: ${{ inputs.test_telegram && '1' || '' }}
+
+      - name: Сохранить память
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: assistant-${{ github.run_id }}
