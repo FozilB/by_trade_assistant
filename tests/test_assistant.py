@@ -343,3 +343,71 @@ def test_no_time_stop_if_trade_moved(env):
     clock["t"] = t + n * M1
     AS.track_all(st)
     assert not any("⏰" in x for x in env["sent"])
+
+
+# ---------------------------------------------------------------- соревнование с ботом
+
+def at_local(env, hh, mm):
+    """Перевести часы теста на hh:mm по Ташкенту того же дня."""
+    t = env["clock"]["t"]
+    day = AS.local_day(t)
+    env["clock"]["t"] = int((day * 86400 + hh * 3600 + mm * 60 - AS.A.DAY_TZ_HOURS * 3600) * 1000)
+    return env["clock"]["t"]
+
+
+def test_duel_report_once_at_2330(env, monkeypatch):
+    st = env["state"]
+    t0 = at_local(env, 12, 0)
+    sig = {"inst": "AERO-USDT-SWAP", "tf": "1h", "kind": "alarm", "ts": t0 - 10 * M1}
+    data = {"signals": [sig],
+            "trades": [{"inst": "AERO-USDT-SWAP", "r": 1.5, "closed": t0 + 3 * H1, "why": "цель 2"},
+                       {"inst": "SOL-USDT-SWAP", "r": -1.0, "closed": t0 + 4 * H1, "why": "стоп"}],
+            "skipped": [{"inst": "BTC-USDT-SWAP", "ts": t0, "why": "широкий стоп"}]}
+    monkeypatch.setattr(AS, "fetch_duel", lambda: data)
+    st["hist"] = [{"inst": "AERO-USDT-SWAP", "t": t0 + H1, "opened": t0, "r": -0.4, "usd": -0.8, "margin": 10, "loss": True},
+                  {"inst": "ETH-USDT-SWAP", "t": t0 + H1, "opened": t0, "r": 2.0, "usd": 4.0, "margin": 10, "loss": False}]
+    at_local(env, 23, 0)
+    AS.maybe_duel_report(st)
+    assert not any("🏁" in x for x in env["sent"])
+    at_local(env, 23, 31)
+    AS.maybe_duel_report(st)
+    AS.maybe_duel_report(st)
+    reports = [x for x in env["sent"] if "🏁" in x]
+    assert len(reports) == 1
+    r = reports[0]
+    assert "🤖 Бот: 2 сд." in r and "+0.50R" in r            # 1.5 − 1.0
+    assert "👤 Вы: 1 сд." in r and "−0.40R" not in r          # ETH не по сигналу — не считается
+    assert "-0.40R" in r and "победил <b>бот</b>" in r
+    assert "пропустил: BTC (широкий стоп)" in r
+    assert "Счёт недели по дням: 🤖 Бот 1 : 0 Вы" in r
+
+
+def test_duel_command_shows_now_without_saving(env, monkeypatch):
+    st = env["state"]
+    monkeypatch.setattr(AS, "fetch_duel", lambda: None)
+    AS.handle_text(st, "/duel")
+    assert "нет данных" in env["sent"][-1] and not st.get("duel_days")
+
+
+def test_hist_keeps_open_time(env):
+    st = env["state"]
+    AS.handle_text(st, "/in aero short 0.795 x20 10")
+    opened = st["pos"]["AERO-USDT-SWAP"]["opened"]
+    AS.handle_text(st, "/out aero 0.79")
+    assert st["hist"][-1]["opened"] == opened
+
+
+def test_bot_command_shows_trades_and_balance(env, monkeypatch):
+    t0 = env["clock"]["t"]
+    data = {"deposit": 100.0, "balance": 101.2, "signals": [], "skipped": [{"inst": "BTC-USDT-SWAP", "ts": t0, "why": "широкий стоп"}],
+            "trades": [{"inst": "PLTR-USDT-SWAP", "tf": "1h", "side": "short", "opened": t0, "entry": 166.3, "stop": 167.75,
+                        "tp1": 164.85, "tp2": 163.4, "t1": False, "closed": None, "size_usd": 229.4, "risk_usd": 2.0},
+                       {"inst": "SOL-USDT-SWAP", "tf": "4h", "side": "short", "opened": t0 - 5 * H1, "entry": 140.0, "exit": 137.0,
+                        "stop": 140.0, "tp1": 138.5, "tp2": 137.0, "t1": True, "closed": t0 - H1, "r": 1.5, "usd": 2.9, "why": "цель 2"}]}
+    monkeypatch.setattr(AS, "fetch_duel", lambda: data)
+    AS.handle_text(env["state"], "/bot")
+    txt = env["sent"][-1]
+    assert "$101.20" in txt and "+1.2%" in txt
+    assert "🔻 SHORT <b>PLTR</b> (1ч)" in txt and "стоп 167.75" in txt and "цель 2 163.4" in txt
+    assert "✅ SOL SHORT" in txt and "+$2.90" in txt
+    assert "BTC (широкий стоп)" in txt
