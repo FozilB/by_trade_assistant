@@ -92,7 +92,11 @@ HELP = ("🤖 <b>Помощник по сделкам</b>\n\n"
         "<code>aero</code> или <code>/analyze aero</code> — разбор монеты\n"
         "<code>/status</code> — открытые сделки\n"
         "<code>/stop aero 0.56</code> — изменить стоп\n"
-        "<code>/out aero</code> — закрыть сопровождение\n\n"
+        "<code>/out aero</code> — закрыть сопровождение\n"
+        "<code>/day</code> — итог дня: сделки, убытки, можно ли ещё входить\n\n"
+        "🧯 <b>Правила дисциплины</b>: пауза после убытка, не больше "
+        f"{A.MAX_LOSSES_PER_DAY} убытков в день, без доливок в минус, стоп не отодвигается дальше, "
+        f"стоп не больше {A.MAX_LOSS_PCT_OF_MARGIN:g}% маржи. Если правило нарушено — бот спросит подтверждение.\n\n"
         "Числа можно писать с запятой. Ответ обычно за несколько секунд; "
         "раз в ~5 минут бывает пауза до минуты, пока перезапускается бот.")
 
@@ -430,10 +434,29 @@ def last_price(inst):
     return cs[-1]["c"] if cs else None
 
 
+def local_day(ms):
+    return int((ms / 1000 + A.DAY_TZ_HOURS * 3600) // 86400)
+
+
+def remember_closed(state, pos, r, total):
+    """Запоминает итог закрытой сделки — для правил дисциплины и /day."""
+    if r is None:
+        return
+    loss = total < 0 if pos.get("qty") else r < 0
+    state.setdefault("hist", []).append({"inst": pos["inst"], "t": now_ms(), "r": round(r, 3),
+                                         "usd": round(total, 2) if pos.get("qty") else None,
+                                         "margin": pos.get("margin"), "loss": bool(loss)})
+    state["hist"] = state["hist"][-A.HISTORY_KEEP:]
+
+
 def close_pos(state, inst, px, why):
     pos = state["pos"].pop(inst)
     r, u = pnl(pos, px) if px else (None, None)
     total = (u or 0) + pos.get("banked", 0)
+    if r is not None and pos.get("t1_hit"):
+        r = (r * (1 - A.TAKE_AT_T1_PCT / 100)
+             + abs(pos["entry"] - pos["t1"]) / pos["r0"] * A.TAKE_AT_T1_PCT / 100)
+    remember_closed(state, pos, r, total)
     txt = f"✅ <b>{S.base_of(inst)}</b> · сопровождение закрыто ({why})"
     if px:
         txt += f" по {price(px)}"
@@ -561,17 +584,111 @@ def slow_checks(pos, inst, px, now):
 
 # ================================================================ Команды
 
-def cmd_in(state, d):
+def today_stats(state, now):
+    day = local_day(now)
+    hist = [h for h in state.get("hist", []) if local_day(h["t"]) == day]
+    losses = [h for h in hist if h["loss"]]
+    usd_sum = sum(h["usd"] for h in hist if h.get("usd") is not None)
+    return hist, losses, usd_sum
+
+
+def discipline(state, p, now):
+    """Нарушенные правила для нового входа: отыгрыш после убытка, лимит убытков, рост ставки, большое плечо."""
+    out = []
+    hist = state.get("hist", [])
+    _, losses, usd_sum = today_stats(state, now)
+    last_loss = max((h["t"] for h in hist if h["loss"]), default=None)
+    if last_loss is not None:
+        passed = (now - last_loss) / M1
+        if passed < A.COOLDOWN_AFTER_LOSS_MIN:
+            out.append(f"после убыточной сделки прошло всего {passed:.0f} мин (пауза {A.COOLDOWN_AFTER_LOSS_MIN} мин). "
+                       "Вход сразу после убытка — это почти всегда отыгрыш.")
+    if len(losses) >= A.MAX_LOSSES_PER_DAY:
+        money = f", итог дня {usd(usd_sum)}" if any(h.get("usd") is not None for h in losses) else ""
+        out.append(f"сегодня уже {len(losses)} убыточные сделки{money}. Лимит на день — {A.MAX_LOSSES_PER_DAY}.")
+    margins = sorted(h["margin"] for h in hist[-10:] if h.get("margin"))
+    if p["margin"] and len(margins) >= 3:
+        usual = margins[len(margins) // 2]
+        if p["margin"] >= A.SIZE_JUMP_X * usual:
+            out.append(f"маржа ${p['margin']:g} — в {p['margin'] / usual:.1f} раза больше обычной (${usual:g}). "
+                       "Увеличивать ставку, чтобы вернуть потерянное, — главный путь к сливу.")
+    if p["qty"] and p["margin"]:
+        loss_pct = p["qty"] * p["r0"] / p["margin"] * 100
+        if loss_pct > A.MAX_LOSS_PCT_OF_MARGIN:
+            stop_pct = p["r0"] / p["entry"] * 100
+            ok_lev = max(1, int(A.MAX_LOSS_PCT_OF_MARGIN / stop_pct))
+            out.append(f"на стопе вы потеряете {loss_pct:.0f}% маржи (лимит {A.MAX_LOSS_PCT_OF_MARGIN:g}%). "
+                       f"Для стопа {stop_pct:.2f}% плечо не выше x{ok_lev}.")
+    if p["liq"] is not None and (p["liq"] - p["stop"]) * (1 if p["side"] == "short" else -1) <= 0:
+        out.append(f"ликвидация {price(p['liq'])} наступит раньше стопа — сделка закроется с потерей всей маржи.")
+    return out
+
+
+def confirm_markup(inst):
+    b = S.base_of(inst)
+    return {"inline_keyboard": [[{"text": "Не вхожу / уже закрыл", "callback_data": f"drop:{b}"}],
+                                [{"text": "Я уже в сделке — всё равно вести", "callback_data": f"force:{b}"}]]}
+
+
+def cmd_in(state, d, force=False):
     inst = norm_inst(d["sym"])
+    b = S.base_of(inst)
+    if inst in state["pos"]:
+        pos = state["pos"][inst]
+        px = last_price(inst)
+        r = pnl(pos, px)[0] if px else 0
+        if r < 0:
+            return say(f"🚫 <b>{b}</b> · сделка уже открыта и сейчас в минусе ({r:+.2f}R).\n"
+                       "Новый вход — это <b>доливка в убыток</b>: средняя цена лучше не станет, "
+                       "а ликвидация подойдёт ближе. Бот такие доливки не сопровождает.\n"
+                       "Если стоп по плану ещё не задет — просто держите стоп. Если план сломан — "
+                       f"закройте позицию и напишите <code>/out {b.lower()}</code>.", pos_markup(inst))
+        return say(f"По <b>{b}</b> уже есть сделка ({r:+.2f}R). Одна монета — одна сделка: "
+                   f"сначала закройте её (<code>/out {b.lower()}</code>), потом новый вход.", pos_markup(inst))
     m = load_market(inst)
     lev = float(d["lev"]) if d.get("lev") else None
     margin = float(d["margin"]) if d.get("margin") else None
     p = make_plan(inst, d["side"], float(d["entry"]), lev, margin, float(d["stop"]) if d.get("stop") else None, m)
-    say(fmt_plan(p, m), pos_markup(inst))
     now = now_ms()
+    broken = discipline(state, p, now)
+    if broken and not force:
+        state.setdefault("pending", {})[inst] = dict(d, ts=now)
+        lines = [f"🧯 <b>{b}</b> · <b>стоп, нарушены правила</b>:"] + [f"• {x}" for x in broken]
+        lines += ["", "Если вы ещё не вошли — не входите. Если уже вошли — лучшее решение сейчас: "
+                      "закрыть позицию с маленьким минусом, пока он маленький.",
+                  "Сделку не веду, пока не нажмёте кнопку."]
+        return say("\n".join(lines), confirm_markup(inst))
+    if broken:
+        p["warn"] = ["🧯 Вход вопреки правилам: " + "; ".join(broken)] + p["warn"]
+        p["forced"] = True
+    say(fmt_plan(p, m), pos_markup(inst))
     p.update({"opened": now, "checked": now, "slow": now})
     p.pop("warn", None)
     state["pos"][inst] = p
+    state.get("pending", {}).pop(inst, None)
+
+
+def cmd_day(state):
+    now = now_ms()
+    hist, losses, usd_sum = today_stats(state, now)
+    lines = ["📅 <b>Итог дня</b>"]
+    if not hist:
+        lines.append("Закрытых сделок сегодня нет.")
+    else:
+        for h in hist:
+            money = f" · {usd(h['usd'])}" if h.get("usd") is not None else ""
+            lines.append(f"{'❌' if h['loss'] else '✅'} {S.base_of(h['inst'])} · {h['r']:+.2f}R{money}")
+        if any(h.get("usd") is not None for h in hist):
+            lines.append(f"Всего: <b>{usd(usd_sum)}</b>")
+    last_loss = max((h["t"] for h in state.get("hist", []) if h["loss"]), default=None)
+    wait = A.COOLDOWN_AFTER_LOSS_MIN - (now - last_loss) / M1 if last_loss else 0
+    if len(losses) >= A.MAX_LOSSES_PER_DAY:
+        lines.append(f"\n⛔ Убытков сегодня: {len(losses)} из {A.MAX_LOSSES_PER_DAY}. На сегодня торговля закончена.")
+    elif wait > 0:
+        lines.append(f"\n⏸ Пауза после убытка: ещё {wait:.0f} мин.")
+    else:
+        lines.append(f"\n🟢 Можно входить по плану. Убытков сегодня: {len(losses)} из {A.MAX_LOSSES_PER_DAY}.")
+    say("\n".join(lines))
 
 
 def find_pos(state, sym):
@@ -620,11 +737,19 @@ def handle_text(state, text):
         inst = find_pos(state, args[0])
         pos = state["pos"][inst]
         new = num(args[1])
-        if (new - pos["entry"]) * (1 if pos["side"] == "short" else -1) < 0 and not pos.get("be"):
+        sgn = 1 if pos["side"] == "short" else -1
+        if (new - pos["entry"]) * sgn < 0 and not pos.get("be"):
             raise ValueError("стоп не с той стороны от входа")
+        if (new - pos["stop"]) * sgn > 0:
+            return say(f"🚫 <b>{S.base_of(inst)}</b> · стоп {price(pos['stop'])} отодвигать дальше нельзя "
+                       f"(вы хотите {price(new)}) — так убыток только растёт.\n"
+                       "Стоп стоит там, где план перестаёт работать. Если цена туда дошла — план не сработал, "
+                       "и выйти по стопу — правильно.", pos_markup(inst))
         pos["stop"] = new
         pos["warned_near"] = False
         return say(f"🛑 <b>{S.base_of(inst)}</b> · стоп теперь {price(new)}.", pos_markup(inst))
+    if cmd in ("/day", "/today", "итог", "день"):
+        return cmd_day(state)
     if cmd in ("/out", "/close", "закрыть"):
         if not args:
             raise ValueError("какую сделку закрыть? /out aero")
@@ -654,6 +779,15 @@ def handle_callback(state, cq):
     if kind == "out":
         inst = find_pos(state, sym)
         return close_pos(state, inst, last_price(inst), "по кнопке")
+    if kind in ("force", "drop"):
+        inst = norm_inst(sym)
+        d = state.get("pending", {}).pop(inst, None)
+        if d is None:
+            return say(f"По {sym} нет входа, ожидающего решения.")
+        if kind == "drop":
+            return say(f"👍 <b>{sym}</b> · правильно. Сделку не веду. Отдых — тоже часть торговли.")
+        d.pop("ts", None)
+        return cmd_in(state, d, force=True)
     if kind == "sl":
         inst = find_pos(state, sym)
         return say(f"Напишите новый стоп так: <code>/stop {sym.lower()} ЦЕНА</code>\n"
@@ -696,6 +830,8 @@ def load_state():
         s = {}
     s.setdefault("pos", {})
     s.setdefault("offset", None)
+    s.setdefault("hist", [])
+    s.setdefault("pending", {})
     return s
 
 

@@ -208,8 +208,8 @@ def test_status_stop_out_commands(env):
     AS.handle_text(st, "/in aero short 0.795 x20 10")
     AS.handle_text(st, "/status")
     assert "AERO" in env["sent"][-1] and "R" in env["sent"][-1]
-    AS.handle_text(st, "/stop aero 0.80")
-    assert st["pos"]["AERO-USDT-SWAP"]["stop"] == 0.80
+    AS.handle_text(st, "/stop aero 0.797")
+    assert st["pos"]["AERO-USDT-SWAP"]["stop"] == 0.797
     AS.handle_callback(st, {"id": "q", "data": "out:AERO"})
     assert not st["pos"] and "закрыто" in env["sent"][-1]
 
@@ -233,3 +233,84 @@ def test_run_loop_with_updates(env, monkeypatch):
     AS.run(seconds=1)
     st = AS.load_state()
     assert st["offset"] == 101 and "AERO-USDT-SWAP" in st["pos"]
+
+
+# ---------------------------------------------------------------- дисциплина
+
+def lose_trade(env):
+    """Вход и стоп — одна убыточная сделка."""
+    st, mk, clock = env["state"], env["mk"], env["clock"]
+    AS.handle_text(st, "/in aero short 0.795 x20 10")
+    pos = st["pos"]["AERO-USDT-SWAP"]
+    t = clock["t"]
+    mk.minute = minutes([pos["entry"], pos["stop"] + 0.0005], t)
+    clock["t"] = t + 2 * M1
+    AS.track_all(st)
+    mk.minute = []
+
+
+def test_stop_cannot_be_widened(env):
+    st = env["state"]
+    AS.handle_text(st, "/in aero short 0.795 x20 10")
+    old = st["pos"]["AERO-USDT-SWAP"]["stop"]
+    AS.handle_text(st, "/stop aero 0.85")
+    assert st["pos"]["AERO-USDT-SWAP"]["stop"] == old and "дальше нельзя" in env["sent"][-1]
+
+
+def test_no_averaging_into_loss(env):
+    st, mk = env["state"], env["mk"]
+    AS.handle_text(st, "/in aero short 0.795 x20 10")
+    pos = dict(st["pos"]["AERO-USDT-SWAP"])
+    mk.minute = minutes([pos["entry"] + 0.5 * pos["r0"]], env["clock"]["t"])
+    AS.handle_text(st, "/in aero short 0.80 x20 10")
+    assert "доливка в убыток" in env["sent"][-1]
+    assert st["pos"]["AERO-USDT-SWAP"]["entry"] == pos["entry"]
+
+
+def test_loss_recorded_and_cooldown_asks_confirmation(env):
+    st = env["state"]
+    lose_trade(env)
+    assert st["hist"] and st["hist"][-1]["loss"]
+    AS.handle_text(st, "/in aero short 0.795 x20 10")
+    assert "отыгрыш" in env["sent"][-1] and not st["pos"]
+    AS.handle_callback(st, {"id": "q", "data": "drop:AERO"})
+    assert not st["pos"] and not st["pending"]
+
+
+def test_force_after_confirmation(env):
+    st = env["state"]
+    lose_trade(env)
+    AS.handle_text(st, "/in aero short 0.795 x20 10")
+    AS.handle_callback(st, {"id": "q", "data": "force:AERO"})
+    assert st["pos"]["AERO-USDT-SWAP"].get("forced")
+    assert "вопреки правилам" in env["sent"][-1]
+
+
+def test_cooldown_passes(env):
+    st, clock = env["state"], env["clock"]
+    lose_trade(env)
+    clock["t"] += (AS.A.COOLDOWN_AFTER_LOSS_MIN + 1) * M1
+    AS.handle_text(st, "/in aero short 0.795 x20 10")
+    assert "AERO-USDT-SWAP" in st["pos"]
+
+
+def test_daily_loss_limit(env):
+    st, clock = env["state"], env["clock"]
+    for _ in range(AS.A.MAX_LOSSES_PER_DAY):
+        lose_trade(env)
+        clock["t"] += (AS.A.COOLDOWN_AFTER_LOSS_MIN + 1) * M1
+        if st["pending"]:
+            break
+    AS.handle_text(st, "/in aero short 0.795 x20 10")
+    assert "Лимит на день" in env["sent"][-1] and not st["pos"]
+    AS.handle_text(st, "/day")
+    assert "торговля закончена" in env["sent"][-1]
+
+
+def test_size_jump_and_big_leverage(env):
+    st = env["state"]
+    st["hist"] = [{"inst": "X-USDT-SWAP", "t": 0, "r": 1.0, "usd": 1.0, "margin": 10, "loss": False}] * 5
+    AS.handle_text(st, "/in aero short 0.795 x20 50")
+    assert "больше обычной" in env["sent"][-1] and not st["pos"]
+    AS.handle_text(st, "/in aero short 0.795 x30 10 стоп 0.81")
+    assert "маржи (лимит" in env["sent"][-1]
