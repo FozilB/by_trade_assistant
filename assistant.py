@@ -94,7 +94,8 @@ HELP = ("🤖 <b>Помощник по сделкам</b>\n\n"
         "<code>/stop aero 0.56</code> — изменить стоп\n"
         "<code>/out aero</code> — закрыть сопровождение\n"
         "<code>/day</code> — итог дня: сделки, убытки, можно ли ещё входить\n"
-        "<code>/duel</code> — счёт соревнования с ботом-конкурентом (итог сам приходит в 23:30)\n\n"
+        "<code>/duel</code> — счёт соревнования с ботом-конкурентом (итог сам приходит в 23:30)\n"
+        "<code>/bot</code> — сделки бота-конкурента: вход, стоп, цели, баланс, прибыль\n\n"
         "🧯 <b>Правила дисциплины</b>: пауза после убытка, не больше "
         f"{A.MAX_LOSSES_PER_DAY} убытков в день, без доливок в минус, стоп не отодвигается дальше, "
         f"стоп по времени ({A.TIME_STOP_HOURS:g} ч на месте — совет выйти), "
@@ -647,7 +648,8 @@ def duel_day(state, data, day):
     per_r = sorted(abs(h["usd"] / h["r"]) for h in state.get("hist", []) if h.get("usd") is not None and abs(h.get("r") or 0) > 0.05)
     usual = per_r[len(per_r) // 2] if per_r else None
     bot_r, me_r = sum(t["r"] for t in bot), sum(h["r"] for h in mine)
-    bot_money = f"≈ {usd(bot_r * usual)} при вашем размере" if usual and bot else None
+    bot_usd = [t["usd"] for t in bot if t.get("usd") is not None]
+    bot_money = usd(sum(bot_usd)) if bot_usd else (f"≈ {usd(bot_r * usual)} при вашем размере" if usual and bot else None)
     my_money = usd(sum(h["usd"] for h in mine if h.get("usd") is not None)) if any(h.get("usd") is not None for h in mine) else None
     lines = [f"🏁 <b>Итог дня {day_label(day)}</b> — вы против бота (по сигналам ⚡)", ""]
     if data is None:
@@ -662,6 +664,9 @@ def duel_day(state, data, day):
         still = [t for t in data.get("trades", []) if not t.get("closed")]
         if still:
             lines.append("   ещё открыты: " + ", ".join(S.base_of(t["inst"]) for t in still))
+        bal = bot_balance_line(data)
+        if bal:
+            lines.append("   " + bal)
     lines.append(side_line("👤 Вы", mine, my_money))
     for h in mine[:6]:
         lines.append(f"   {S.base_of(h['inst'])} {h['r']:+.2f}R")
@@ -701,6 +706,52 @@ def duel_report(state, store=True):
         is_week_end = (day + 3) % 7 == A.DUEL_WEEK_DAY
         text += "\n\n" + ("📅 <b>Итог недели</b>\n" if is_week_end and store else "") + "\n".join(week)
     say(text)
+
+
+def fmt_time(ms):
+    return time.strftime("%d.%m %H:%M", time.gmtime(ms / 1000 + A.DAY_TZ_HOURS * 3600))
+
+
+def bot_balance_line(data):
+    if not data or "balance" not in data:
+        return None
+    dep, bal = data.get("deposit", 100.0), data["balance"]
+    return f"💰 Баланс бота: <b>${bal:.2f}</b> (старт ${dep:g}, {(bal / dep - 1) * 100:+.1f}%)"
+
+
+def cmd_bot(state):
+    """/bot — что сейчас делает бот-конкурент: баланс, открытые и последние закрытые сделки."""
+    data = fetch_duel()
+    if data is None:
+        return say("🤖 Нет данных бота-конкурента. Он публикует итоги после первого запуска второго бота (RSI-my).")
+    lines = ["🤖 <b>Бот-конкурент</b>"]
+    bal = bot_balance_line(data)
+    if bal:
+        lines.append(bal)
+    trades = data.get("trades", [])
+    opened = [t for t in trades if not t.get("closed")]
+    lines += ["", "<b>Открытые сделки</b>" if opened else "Открытых сделок нет."]
+    for t in opened:
+        arrow = "🔻 SHORT" if t.get("side", "short") == "short" else "🟢 LONG"
+        tf = {"1h": "1ч", "4h": "4ч"}.get(t.get("tf"), t.get("tf", ""))
+        lines.append(f"{arrow} <b>{S.base_of(t['inst'])}</b> ({tf}) · вход {price(t['entry'])} в {fmt_time(t['opened'])}")
+        stop = "безубыток " + price(t["stop"]) if t.get("t1") else price(t["stop"])
+        lines.append(f"   стоп {stop} · цель 1 {price(t['tp1'])}{' ✅' if t.get('t1') else ''} · цель 2 {price(t['tp2'])}")
+        if t.get("size_usd"):
+            lines.append(f"   объём ${t['size_usd']:.0f} · риск ${t.get('risk_usd', 0):.2f}")
+    closed = sorted((t for t in trades if t.get("closed")), key=lambda t: t["closed"], reverse=True)[:5]
+    if closed:
+        lines += ["", "<b>Последние закрытые</b>"]
+        for t in closed:
+            arrow = "SHORT" if t.get("side", "short") == "short" else "LONG"
+            money = f" · {usd(t['usd'])}" if t.get("usd") is not None else ""
+            lines.append(f"{'✅' if t['r'] > 0 else '❌'} {S.base_of(t['inst'])} {arrow} · {fmt_time(t['opened'])} → "
+                         f"{fmt_time(t['closed'])}\n   вход {price(t['entry'])} → выход {price(t.get('exit', t['entry']))} · "
+                         f"{t['r']:+.2f}R{money} ({t['why']})")
+    skipped = sorted(data.get("skipped", []), key=lambda x: x["ts"], reverse=True)[:3]
+    if skipped:
+        lines += ["", "Пропустил: " + ", ".join(f"{S.base_of(x['inst'])} ({x['why']})" for x in skipped)]
+    say("\n".join(lines))
 
 
 def maybe_duel_report(state):
@@ -884,6 +935,8 @@ def handle_text(state, text):
         return cmd_day(state)
     if cmd in ("/duel", "/score", "счёт", "счет", "табло"):
         return duel_report(state, store=False)
+    if cmd in ("/bot", "/rival", "бот", "конкурент"):
+        return cmd_bot(state)
     if cmd in ("/out", "/close", "закрыть"):
         if not args:
             raise ValueError("какую сделку закрыть? /out aero")

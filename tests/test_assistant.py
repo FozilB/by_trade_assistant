@@ -395,3 +395,19 @@ def test_hist_keeps_open_time(env):
     opened = st["pos"]["AERO-USDT-SWAP"]["opened"]
     AS.handle_text(st, "/out aero 0.79")
     assert st["hist"][-1]["opened"] == opened
+
+
+def test_bot_command_shows_trades_and_balance(env, monkeypatch):
+    t0 = env["clock"]["t"]
+    data = {"deposit": 100.0, "balance": 101.2, "signals": [], "skipped": [{"inst": "BTC-USDT-SWAP", "ts": t0, "why": "широкий стоп"}],
+            "trades": [{"inst": "PLTR-USDT-SWAP", "tf": "1h", "side": "short", "opened": t0, "entry": 166.3, "stop": 167.75,
+                        "tp1": 164.85, "tp2": 163.4, "t1": False, "closed": None, "size_usd": 229.4, "risk_usd": 2.0},
+                       {"inst": "SOL-USDT-SWAP", "tf": "4h", "side": "short", "opened": t0 - 5 * H1, "entry": 140.0, "exit": 137.0,
+                        "stop": 140.0, "tp1": 138.5, "tp2": 137.0, "t1": True, "closed": t0 - H1, "r": 1.5, "usd": 2.9, "why": "цель 2"}]}
+    monkeypatch.setattr(AS, "fetch_duel", lambda: data)
+    AS.handle_text(env["state"], "/bot")
+    txt = env["sent"][-1]
+    assert "$101.20" in txt and "+1.2%" in txt
+    assert "🔻 SHORT <b>PLTR</b> (1ч)" in txt and "стоп 167.75" in txt and "цель 2 163.4" in txt
+    assert "✅ SOL SHORT" in txt and "+$2.90" in txt
+    assert "BTC (широкий стоп)" in txt
