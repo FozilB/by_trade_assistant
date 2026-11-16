@@ -1,12 +1,11 @@
 """Помощник по сделкам OKX в Telegram.
 
 Вы сообщаете о входе (форма в Telegram или команда /in), бот отвечает планом:
-стоп по графику, цели, суммы в долларах, ликвидация, предупреждения.
-Потом сопровождает сделку до закрытия: безубыток на 1R, цель 1 (закрыть 50%), цель 2,
+вердикт (по сетапу вход или нет), стоп по графику, цели, суммы в долларах, ликвидация, предупреждения.
+Потом сопровождает сделку до закрытия: безубыток, защита прибыли, цель 1 (закрыть 50%), цель 2,
 стоп по новым максимумам/минимумам 1ч, Hammer/Star против сделки, перепроданность, открытие биржи у токенов акций.
 
-Один запуск держит связь с Telegram RUN_SECONDS секунд (около 4.5 минут), затем начинается следующий —
-поэтому ответы приходят за секунды. Запуски идут цепочкой из GitHub Actions.
+Один запуск держит связь с Telegram RUN_SECONDS секунд (около 4.5 минут), затем начинается следующий.
 
 Команды:
   /in aero short 0.553 x20 10 [стоп 0.57]   — я вошёл (монета, шорт/лонг, вход, плечо, маржа $)
@@ -84,6 +83,8 @@ def pos_markup(inst):
 
 
 HELP = ("🤖 <b>Помощник по сделкам</b>\n\n"
+        "💡 <b>Перед входом напишите название монеты</b> (например <code>aero</code>) — "
+        "бот скажет, стоит ли входить.\n\n"
         "<b>➕ Новая сделка / анализ</b> — кнопка внизу открывает форму.\n\n"
         "Или командами:\n"
         "<code>/in aero short 0.553 x20 10</code> — вошёл: монета, шорт/лонг, вход, плечо, маржа $\n"
@@ -231,7 +232,7 @@ def warnings(inst, side, entry, stop, r, liq, m):
         w.append(f"⚠️ RSI(15м) {rsi15:.0f} — {'перепроданность' if side == 'short' else 'перекупленность'}, вход у края движения.")
     lv = levels(side, entry, m)
     if lv and abs(lv[0] - entry) < r:
-        w.append(f"⚠️ {'Поддержка' if side == 'short' else 'Сопротивление'} {price(lv[0])} ближе 1R — места мало.")
+        w.append(f"⚠️ {'Поддержка' if side == 'short' else 'Сопротивление'} {price(lv[0])} ближе, чем стоп — для прибыли места мало.")
     day = c1[-24:]
     if day:
         if side == "short":
@@ -242,7 +243,7 @@ def warnings(inst, side, entry, stop, r, liq, m):
             w.append(f"⚠️ Цена уже прошла {moved:.1f}% за сутки в вашу сторону — вход вдогонку.")
     sma = S.sma_last([x["c"] for x in m["c4"]], 50)
     if sma and ((side == "short" and entry > sma) or (side == "long" and entry < sma)):
-        w.append(f"⚠️ Против тренда 4ч: цена {'выше' if side == 'short' else 'ниже'} MA50 ({price(sma)}).")
+        w.append(f"⚠️ Против тренда на 4ч: цена {'выше' if side == 'short' else 'ниже'} средней линии ({price(sma)}).")
     block = S.stock_block(inst, now_ms(), 60)
     if block:
         w.append(f"⚠️ Скоро {block} — возможен гэп.")
@@ -275,6 +276,54 @@ def usd(x):
     return f"{'+' if x >= 0 else '−'}${abs(x):.2f}"
 
 
+# Перевод причин сканера на простой язык
+PLAIN = (
+    ("MA50", "на 4ч нет падения: цена выше средней линии"),
+    ("вне диапазона", "отскок слишком большой — это уже не отскок"),
+    ("поздно", "цена уже сильно упала, вход поздний"),
+    ("Hammer", "рядом Hammer — возможен отскок вверх"),
+    ("мало места", "до поддержки близко, прибыли будет мало"),
+    ("не у сопротивления", "цена не у сопротивления"),
+    ("свечи-отказа", "нет свечи-разворота вниз на 1ч"),
+    ("RSI", "рост ещё не выдохся"),
+    ("максимум", "на 4ч нет нисходящего тренда"),
+)
+
+
+def plain_reason(d):
+    t = str(d)
+    for key, text in PLAIN:
+        if key in t:
+            return text
+    return t
+
+
+def verdict(p, m):
+    """Одна строка вверху: по сетапу вход или нет, и почему."""
+    e = p["entry"]
+    stop_pct = abs(p["stop"] - e) / e * 100
+    far = stop_pct > A.FAR_STOP_PCT
+    bad, good = [], None
+    if m is not None and p["side"] == "short":
+        kind, d = S.detect(m["c4"], m["c1"], e, m["c15"])
+        if kind == "signal":
+            good = "нисходящий тренд, цена у сопротивления, есть свеча-разворот"
+        elif kind == "watch":
+            bad.append("цена у сопротивления, но свечи-разворота ещё нет — рано")
+        else:
+            bad.append(plain_reason(d))
+    if bad:
+        text = "⛔ <b>Вход не по сетапу</b>\n" + "\n".join(f"• {x}" for x in bad)
+        if far:
+            text += f"\n• стоп далеко — {stop_pct:.1f}% от входа"
+        return text
+    if far:
+        return f"⛔ <b>Стоп слишком далеко ({stop_pct:.1f}%) — место для входа плохое</b>"
+    if good:
+        return f"✅ <b>Вход по сетапу</b>: {good}"
+    return None
+
+
 def fmt_plan(p, m=None):
     side, e = p["side"], p["entry"]
     b = S.base_of(p["inst"])
@@ -282,26 +331,34 @@ def fmt_plan(p, m=None):
     head = f"{arrow} <b>{b}</b> · вход {price(e)}"
     if p["lev"] and p["margin"]:
         head += f" · x{p['lev']:g} · маржа ${p['margin']:g} · позиция ${p['notional']:.0f}"
-    lines = [head, ""]
+    lines = []
+    v = verdict(p, m)
+    if v:
+        lines += [v, ""]
+    lines += [head, ""]
     q = p["qty"]
-    loss = f" → {usd(-q * p['r0'])} ({q * p['r0'] / p['margin'] * 100:.0f}% маржи)" if q else ""
-    src = "ваш" if p["user_stop"] else "по графику, за ближайшим уровнем 15м"
+    stop_pct = abs(p["stop"] - e) / e * 100
+    loss = (f" → потеряете ${q * p['r0']:.2f} ({q * p['r0'] / p['margin'] * 100:.0f}% маржи)") if q else ""
+    src = "ваш" if p["user_stop"] else "за ближайшим максимумом на 15м"
     lines.append(f"🛑 <b>Стоп: {price(p['stop'])}</b> ({S.pct(p['stop'], e):+.2f}%, {src}){loss}")
+    if p["margin"] and stop_pct > A.FAR_STOP_PCT:
+        limit = p["margin"] * A.RISK_PCT_OF_MARGIN / 100
+        size = limit / (stop_pct / 100)
+        extra = f" (маржа ${size / p['lev']:.1f} при x{p['lev']:g})" if p["lev"] else ""
+        lines.append(f"💡 Чтобы потерять не больше ${limit:.2f} ({A.RISK_PCT_OF_MARGIN:g}% маржи), "
+                     f"позиция должна быть около ${size:.0f}{extra}.")
     half = A.TAKE_AT_T1_PCT / 100
-    g1 = f" → {usd(q * abs(e - p['t1']) * half)} за {A.TAKE_AT_T1_PCT}%" if q else ""
-    g2 = f" → ещё {usd(q * abs(e - p['t2']) * (1 - half))}" if q else ""
-    lines.append(f"🎯 <b>Цель 1: {price(p['t1'])}</b> ({S.pct(p['t1'], e):+.2f}%, {p['t1_note']}){g1}")
+    g1 = f" → +${q * abs(e - p['t1']) * half:.2f}" if q else ""
+    g2 = f" → ещё +${q * abs(e - p['t2']) * (1 - half):.2f}" if q else ""
+    lines.append(f"🎯 <b>Цель 1: {price(p['t1'])}</b> ({S.pct(p['t1'], e):+.2f}%) — закройте половину{g1}")
     lines.append(f"🎯 <b>Цель 2: {price(p['t2'])}</b> ({S.pct(p['t2'], e):+.2f}%){g2}")
-    lines.append(f"Риск/прибыль до цели 1: 1 к {abs(p['t1'] - e) / p['r0']:.1f}")
+    lines.append(f"На каждый $1 риска — около ${abs(p['t1'] - e) / p['r0']:.1f} прибыли.")
     if p["liq"]:
         ok = (p["liq"] - p["stop"]) * (1 if side == "short" else -1) > 0
         lines.append(f"Ликвидация ≈ {price(p['liq'])} {'✅ дальше стопа' if ok else '🚨 РАНЬШЕ СТОПА'}")
-    if m is not None and side == "short":
-        kind, d = S.detect(m["c4"], m["c1"], e, m["c15"])
-        lines.append("✅ Совпадает с сетапом сканера." if kind == "signal" else f"Сетап сканера: {d if kind is None else 'наблюдение, свечи-отказа ещё нет'}.")
     if p["warn"]:
         lines += [""] + p["warn"]
-    lines += ["", "Сопровождаю: безубыток на 1R, цель 1 — закрыть 50%, дальше стоп по структуре 1ч."]
+    lines += ["", "Слежу за ценой: напишу, когда переносить стоп и когда забирать прибыль."]
     return "\n".join(lines)
 
 
@@ -322,7 +379,7 @@ def analyze(inst):
     res = sorted({p for _, p in S.pivots(c1[-120:], 3)[0] + h4 if p > px})[:2]
     sup = levels("short", px, m)[:2]
     lines = [f"🔍 <b>{b}</b> · цена {price(px)}", "",
-             f"4ч: тренд {trend}, цена {'ниже' if sma and px < sma else 'выше'} MA50 ({price(sma) if sma else '—'})",
+             f"4ч: тренд {trend}, цена {'ниже' if sma and px < sma else 'выше'} средней линии ({price(sma) if sma else '—'})",
              f"RSI: 1ч {rsi1:.0f} · 4ч {rsi4:.0f}" if rsi1 and rsi4 else "RSI: —",
              "Сопротивления выше: " + (", ".join(price(x) for x in res) or "нет"),
              "Поддержки ниже: " + (", ".join(price(x) for x in sup) or "нет")]
@@ -334,12 +391,12 @@ def analyze(inst):
     if kind == "signal":
         lines += ["", "✅ <b>Сейчас есть сетап «шорт от нижнего максимума»</b>"]
     elif kind == "watch":
-        lines += ["", f"👀 Цена у сопротивления {price(d['level'][1])} — ждать свечу-отказ на 1ч"]
+        lines += ["", f"👀 Цена у сопротивления {price(d['level'][1])} — ждать свечу-разворот на 1ч"]
     else:
-        lines += ["", f"Сетапа для шорта нет: {d}"]
+        lines += ["", f"⛔ Для шорта сейчас не подходит: {plain_reason(d)}"]
     p = make_plan(inst, "short", px, None, None, None, m)
     lines += ["", f"Если шорт отсюда: стоп {price(p['stop'])} ({S.pct(p['stop'], px):+.2f}%), "
-                  f"цель 1 {price(p['t1'])} ({S.pct(p['t1'], px):+.2f}%), 1 к {abs(p['t1'] - px) / p['r0']:.1f}",
+                  f"цель 1 {price(p['t1'])} ({S.pct(p['t1'], px):+.2f}%)",
               f"<a href=\"{S.chart_link(inst)}\">График TradingView</a>"]
     return "\n".join(lines)
 
@@ -382,6 +439,14 @@ def close_pos(state, inst, px, why):
         txt += f" по {price(px)}"
         if pos.get("qty"):
             txt += f"\nИтог сделки ≈ {usd(total)}"
+        if r is not None and r > 0 and why.startswith(("по вашей", "по кнопке")):
+            for name, lvl in (("цели 1", pos["t1"]), ("цели 2", pos["t2"])):
+                if abs(px - lvl) <= 0.3 * pos["r0"]:
+                    txt += f"\n👍 Закрыто у {name} — выход по плану."
+                    break
+            else:
+                nxt = pos["t2"] if pos.get("t1_hit") else pos["t1"]
+                txt += f"\nЗакрыто раньше цели: до неё оставалось ещё {abs(nxt - px) / px * 100:.1f}%."
     say(txt)
 
 
@@ -412,8 +477,20 @@ def track(state, inst, now):
         if not pos.get("be") and reached(pos["entry"] - (1 if short else -1) * A.BREAKEVEN_AT_R * pos["r0"]):
             pos["be"] = True
             pos["stop"] = pos["entry"]
-            say(f"🔒 <b>{b}</b> · прошли {A.BREAKEVEN_AT_R:g}R. Перенесите стоп в безубыток: <b>{price(pos['entry'])}</b>.\n"
-                f"Теперь сделка бесплатная — убытка уже не будет.", pos_markup(inst))
+            say(f"🔒 <b>{b}</b> · цена прошла в вашу сторону столько же, сколько вы рискуете. "
+                f"Перенесите стоп в безубыток — на цену входа <b>{price(pos['entry'])}</b>.\n"
+                f"Теперь убытка уже не будет.", pos_markup(inst))
+        sgn = 1 if short else -1
+        if pos.get("be") and not pos.get("locked") and reached(pos["entry"] - sgn * A.LOCK_AT_R * pos["r0"]):
+            lock = pos["entry"] - sgn * 0.5 * A.LOCK_AT_R * pos["r0"]
+            better = lock < pos["stop"] if short else lock > pos["stop"]
+            if better:
+                pos["locked"] = True
+                pos["stop"] = lock
+                left = 1 - (half if pos.get("t1_hit") else 0)
+                gain = (f" Даже при развороте вы заберёте около +${q * abs(pos['entry'] - lock) * left:.2f}.") if q else ""
+                say(f"🔐 <b>{b}</b> · прибыль уже вдвое больше риска. "
+                    f"Перенесите стоп на <b>{price(lock)}</b>.{gain}", pos_markup(inst))
         if not pos.get("t1_hit") and reached(pos["t1"]):
             pos["t1_hit"] = True
             pos["banked"] = q * abs(pos["entry"] - pos["t1"]) * half if q else 0
