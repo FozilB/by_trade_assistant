@@ -96,6 +96,7 @@ HELP = ("🤖 <b>Помощник по сделкам</b>\n\n"
         "<code>/day</code> — итог дня: сделки, убытки, можно ли ещё входить\n\n"
         "🧯 <b>Правила дисциплины</b>: пауза после убытка, не больше "
         f"{A.MAX_LOSSES_PER_DAY} убытков в день, без доливок в минус, стоп не отодвигается дальше, "
+        f"стоп по времени ({A.TIME_STOP_HOURS:g} ч на месте — совет выйти), "
         f"стоп не больше {A.MAX_LOSS_PCT_OF_MARGIN:g}% маржи. Если правило нарушено — бот спросит подтверждение.\n\n"
         "Числа можно писать с запятой. Ответ обычно за несколько секунд; "
         "раз в ~5 минут бывает пауза до минуты, пока перезапускается бот.")
@@ -490,6 +491,7 @@ def track(state, inst, now):
             continue
         hit_stop = x["h"] >= pos["stop"] if short else x["l"] <= pos["stop"]
         best = x["l"] if short else x["h"]
+        pos["best_r"] = max(pos.get("best_r", 0.0), (pos["entry"] - best) * (1 if short else -1) / pos["r0"])
         if hit_stop:
             if pos.get("be") or pos.get("t1_hit"):
                 close_pos(state, inst, pos["stop"], f"стоп {price(pos['stop'])} задет, он был в безубытке или выше")
@@ -533,11 +535,31 @@ def track(state, inst, now):
             f"Не двигайте и не закрывайте раньше — стоп стоит за уровнем, это и есть план. Риск известен заранее.")
     elif abs(pos["stop"] - px) > 0.75 * pos["r0"]:
         pos["warned_near"] = False
+    time_stop(pos, inst, px, now)
     pos["checked"] = now
     if now - pos.get("slow", 0) >= 5 * M1:
         pos["slow"] = now
         slow_checks(pos, inst, px, now)
     return True
+
+
+def time_stop(pos, inst, px, now):
+    """Стоп по времени: сделка давно открыта, а цена так и не пошла в нашу сторону — предложить выйти."""
+    if pos.get("warn_time") or pos.get("be") or pos.get("t1_hit"):
+        return
+    hours = (now - pos["opened"]) / H1
+    if hours < A.TIME_STOP_HOURS or pos.get("best_r", 0.0) >= A.TIME_STOP_MIN_R:
+        return
+    pos["warn_time"] = True
+    b = S.base_of(inst)
+    r, u = pnl(pos, px)
+    now_txt = f"{r:+.2f}R" + (f" ({usd(u)})" if u is not None else "")
+    say(f"⏰ <b>{b}</b> · сделка открыта {hours:.0f} ч, а цена так и не пошла в вашу сторону "
+        f"(лучшее движение +{pos.get('best_r', 0.0):.2f}R, сейчас {now_txt}).\n"
+        "Сделка не работает по плану. Спокойный выход сейчас — в ноль или с маленьким минусом — "
+        "это правильное решение, а не слабость. Деньги, которые стоят на месте, — тоже риск.\n"
+        f"Если оставляете — стоп не отодвигать и не доливать. Закрыли: <code>/out {b.lower()}</code>",
+        pos_markup(inst))
 
 
 def slow_checks(pos, inst, px, now):

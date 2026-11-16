@@ -314,3 +314,32 @@ def test_size_jump_and_big_leverage(env):
     assert "больше обычной" in env["sent"][-1] and not st["pos"]
     AS.handle_text(st, "/in aero short 0.795 x30 10 стоп 0.81")
     assert "маржи (лимит" in env["sent"][-1]
+
+
+def test_time_stop_when_price_stands(env):
+    st, mk, clock = env["state"], env["mk"], env["clock"]
+    AS.handle_text(st, "/in aero short 0.795 x20 10")
+    pos = st["pos"]["AERO-USDT-SWAP"]
+    e, r = pos["entry"], pos["r0"]
+    t = clock["t"]
+    n = int(AS.A.TIME_STOP_HOURS * 60) + 5
+    mk.minute = minutes([e + (0.1 if i % 2 else -0.1) * r for i in range(n)], t)
+    clock["t"] = t + n * M1
+    AS.track_all(st)
+    assert sum("⏰" in x for x in env["sent"]) == 1
+    clock["t"] += 10 * M1
+    AS.track_all(st)
+    assert sum("⏰" in x for x in env["sent"]) == 1  # только один раз
+
+
+def test_no_time_stop_if_trade_moved(env):
+    st, mk, clock = env["state"], env["mk"], env["clock"]
+    AS.handle_text(st, "/in aero short 0.795 x20 10")
+    pos = st["pos"]["AERO-USDT-SWAP"]
+    e, r = pos["entry"], pos["r0"]
+    t = clock["t"]
+    n = int(AS.A.TIME_STOP_HOURS * 60) + 5
+    mk.minute = minutes([e - 0.7 * r if i == 30 else e for i in range(n)], t)
+    clock["t"] = t + n * M1
+    AS.track_all(st)
+    assert not any("⏰" in x for x in env["sent"])
