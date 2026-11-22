@@ -387,28 +387,18 @@ def fmt_plan(p, m=None):
 
 
 def analyze(inst, m=None):
+    """Вверху — один вывод (входить / ждать / не входить) и условие входа, ниже — подробности."""
     m = m or load_market(inst)
     px = m["px"]
     b = S.base_of(inst)
-    c4, c1 = m["c4"], m["c1"]
-    rsi1 = S.rsi_series([x["c"] for x in c1])[-1]
-    rsi4 = S.rsi_series([x["c"] for x in c4])[-1]
-    zlines, z = Z.report(m)
-    lines = [f"🔍 <b>{b}</b> · цена {price(px)}",
-             f"RSI: 1ч {rsi1:.0f} · 4ч {rsi4:.0f}" if rsi1 and rsi4 else "RSI: —", ""] + zlines
-    if z["trend"] != "up":
-        kind, d = S.detect(c4, c1, px, m["c15"])
-        if kind == "signal":
-            lines += ["", "✅ <b>Сейчас есть сетап «шорт от нижнего максимума»</b>"]
-        elif kind == "watch":
-            lines += ["", f"👀 Сетап сканера: цена у сопротивления {price(d['level'][1])} — ждать свечу-разворот на 1ч"]
-        else:
-            lines += ["", f"⛔ Сетап сканера для шорта: нет — {plain_reason(d)}"]
-    side = "long" if z["trend"] == "up" else "short"
-    p = make_plan(inst, side, px, None, None, None, m)
-    lines += ["", f"Если {'лонг' if side == 'long' else 'шорт'} прямо отсюда: стоп {price(p['stop'])} "
-                  f"({S.pct(p['stop'], px):+.2f}%), цель 1 {price(p['t1'])} ({S.pct(p['t1'], px):+.2f}%)",
-              f"<a href=\"{S.chart_link(inst)}\">График TradingView</a>"]
+    rsi1 = S.rsi_series([x["c"] for x in m["c1"]])[-1]
+    rsi4 = S.rsi_series([x["c"] for x in m["c4"]])[-1]
+    main, det, z = Z.report(m)
+    lines = [f"🔍 <b>{b}</b> · цена {price(px)}", ""] + main
+    lines += ["", "<b>Подробно</b>"] + det
+    if rsi1 and rsi4:
+        lines.append(f"RSI: 1ч {rsi1:.0f} · 4ч {rsi4:.0f}")
+    lines.append(f"<a href=\"{S.chart_link(inst)}\">График TradingView</a>")
     return "\n".join(lines), z
 
 

@@ -364,7 +364,8 @@ def test_analyze_sends_chart_and_zones(env):
     AS.handle_text(env["state"], "/levels aero")
     assert env["photos"] and env["photos"][-1][:8] == b"\x89PNG\r\n\x1a\n"
     text = env["sent"][-1]
-    assert "Тренд 4ч" in text and "Сопротивления" in text and "📍" in text
+    assert "СЕЙЧАС" in text and "Сопротивления" in text and "Подробно" in text
+    assert text.index("СЕЙЧАС") < text.index("Подробно")
 
 
 def test_zones_are_ranges_around_turns(env):
@@ -386,8 +387,8 @@ def test_hammer_in_downtrend_mid_air_is_false():
     last = cs[-1]["c"]
     cs.append(_candle(last, last + 0.02, last - 0.5, last + 0.01, 30))  # длинная нижняя тень
     assert S.is_hammer(cs, len(cs) - 1)
-    out = Z.pattern_check(cs, "down", [], [], None, 0.15)
-    assert out and "ложн" in out[0] and any("против тренда" in x for x in out)
+    out, info = Z.pattern_check(cs, "down", [], [], None, 0.15)
+    assert info["status"] == "false" and "ЛОЖН" in out[0] and any("против тренда" in x for x in out)
 
 
 def test_star_at_resistance_confirmed_is_working():
@@ -398,5 +399,30 @@ def test_star_at_resistance_confirmed_is_working():
     i = len(cs) - 2
     assert S.is_star(cs, i, 10)
     zone = {"lo": last + 0.3, "hi": last + 0.95, "touches": 3, "h4": True}
-    out = Z.pattern_check(cs, "down", [zone], [], None, 0.3)
-    assert out and "рабоч" in out[0]
+    out, info = Z.pattern_check(cs, "down", [zone], [], None, 0.3)
+    assert info["status"] == "ok" and "рабоч" in out[0]
+
+
+def test_downtrend_fake_break_down_in_zone_says_wait_not_long():
+    """Как было с AAVE: тренд вниз, цена в зоне, свечу проткнуло вниз и вернуло — не лонг, а ждать шорт."""
+    cs = [_candle(100, 100.3, 99.7, 100, i) for i in range(30)]
+    cs.append(_candle(96.8, 96.88, 95.9, 96.7, 30))
+    zone = {"lo": 96.37, "hi": 96.9, "touches": 2, "h4": True}
+    sup = [{"lo": 90.7, "hi": 91.3, "touches": 2, "h4": True}]
+    res = [{"lo": 98.0, "hi": 98.6, "touches": 2, "h4": False}]
+    out = "\n".join(Z.decide(96.78, "down", res, sup, zone, 0.6, cs, None))
+    assert "НЕ ВХОДИТЬ" in out and "ШОРТ, если свеча 1ч закроется ниже 96.37" in out
+    assert "МОЖНО ЛОНГ" not in out and "Отмена" in out
+
+
+def test_mid_range_says_do_not_enter():
+    cs = [_candle(100, 100.3, 99.7, 100, i) for i in range(30)]
+    res = [{"lo": 103, "hi": 103.5, "touches": 3, "h4": True}]
+    sup = [{"lo": 95, "hi": 95.5, "touches": 2, "h4": True}]
+    out = "\n".join(Z.decide(100, "down", res, sup, None, 0.6, cs, None))
+    assert "НЕ ВХОДИТЬ" in out and "отката вверх к зоне 103" in out
+
+
+def test_wick_through_both_sides_is_no_signal():
+    z = {"lo": 96.37, "hi": 96.9}
+    assert Z.candle_vs_zone(_candle(96.8, 96.95, 95.9, 96.7), z) is None

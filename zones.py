@@ -86,11 +86,13 @@ TREND_TEXT = {"down": "📉 вниз — максимумы и минимумы 
 # ================================================================ Что сейчас ждать
 
 def candle_vs_zone(c, z):
-    """Как последняя закрытая свеча повела себя у зоны."""
+    """Как последняя закрытая свеча 1ч повела себя у зоны."""
+    if c["h"] > z["hi"] and c["l"] < z["lo"]:
+        return None           # проколола зону с обеих сторон — сигнала нет
     if c["h"] > z["hi"] and c["c"] < z["hi"] and c["o"] < z["hi"]:
         return "fake_up"      # прокол вверх тенью, закрытие обратно под зоной
     if c["l"] < z["lo"] and c["c"] > z["lo"] and c["o"] > z["lo"]:
-        return "fake_down"
+        return "fake_down"    # прокол вниз тенью, закрытие обратно над зоной
     if c["c"] > z["hi"] and c["o"] <= z["hi"]:
         return "break_up"
     if c["c"] < z["lo"] and c["o"] >= z["lo"]:
@@ -98,96 +100,15 @@ def candle_vs_zone(c, z):
     return None
 
 
-def trade_hint(side, entry, zone_edge, a1):
-    """Стоп за зоной с запасом и максимальное плечо (ликвидация примерно вдвое дальше стопа)."""
-    buf = A.ZONE_STOP_BUFFER_ATR1 * a1
-    stop = zone_edge + buf if side == "short" else zone_edge - buf
-    stop_pct = abs(stop - entry) / entry * 100
-    max_lev = max(1, int(A.LIQ_SAFETY_PCT / stop_pct)) if stop_pct > 0 else None
-    return stop, stop_pct, max_lev
-
-
-def situation(px, tr, res, sup, at, a1, c1):
-    """Возвращает (где цена, что делать) — простым языком."""
-    last = c1[-1]
-    r0, s0 = (res[0] if res else None), (sup[0] if sup else None)
-    lines = []
-
-    def hint(side, entry, edge, extra=""):
-        stop, pct, lev = trade_hint(side, entry, edge, a1)
-        word = "Шорт" if side == "short" else "Лонг"
-        return (f"{word}: вход около {price(entry)}, стоп за зоной {price(stop)} ({pct:.2f}%), "
-                f"плечо не выше x{lev}{extra}")
-
-    if at is not None:
-        mid = (at["lo"] + at["hi"]) / 2
-        kind = candle_vs_zone(last, at)
-        role = "сопротивления" if px <= mid or tr == "down" else "поддержки"
-        if tr == "up" and px >= at["lo"]:
-            role = "поддержки"
-        where = f"📍 Цена <b>в зоне {role}</b> {fmt_zone(at)}"
-        if kind == "fake_up":
-            lines += ["🪤 Последняя свеча 1ч проколола зону вверх и закрылась обратно — <b>ложный пробой</b>.",
-                      "Это сильный сигнал на шорт" + (" по тренду." if tr != "up" else ", но тренд вверх — осторожно.")]
-            if tr != "up":
-                lines.append(hint("short", px, last["h"]))
-        elif kind == "fake_down":
-            lines += ["🪤 Последняя свеча 1ч проколола зону вниз и закрылась обратно — <b>ложный пробой</b>.",
-                      "Это сильный сигнал на лонг" + (" по тренду." if tr != "down" else ", но тренд вниз — осторожно.")]
-            if tr != "down":
-                lines.append(hint("long", px, last["l"]))
-        elif kind == "break_up":
-            lines += ["⬆️ Свеча 1ч закрылась <b>выше</b> зоны — пробой вверх.",
-                      f"Не догоняй. Жди ретест: цена вернётся к {price(at['hi'])} сверху и удержится → лонг."]
-        elif kind == "break_down":
-            lines += ["⬇️ Свеча 1ч закрылась <b>ниже</b> зоны — пробой вниз.",
-                      f"Не догоняй. Жди ретест: цена вернётся к {price(at['lo'])} снизу и не пробьёт → шорт."]
-        elif tr == "down":
-            lines += ["⏳ <b>Жди отказа</b>: Star или длинную верхнюю тень и закрытие свечи 15м/1ч "
-                      f"<b>под {price(at['lo'])}</b>. Без этого не входи.",
-                      hint("short", at["lo"], at["hi"], " — только после подтверждения")]
-        elif tr == "up":
-            lines += ["⏳ <b>Жди отскока</b>: Hammer или длинную нижнюю тень и закрытие свечи 15м/1ч "
-                      f"<b>над {price(at['hi'])}</b>. Без этого не входи.",
-                      hint("long", at["hi"], at["lo"], " — только после подтверждения")]
-        else:
-            lines += ["⏳ Боковик: жди, что сделает свеча 1ч у зоны — отказ (тогда вход от зоны) "
-                      "или закрытие за зоной (тогда ждать ретест)."]
-        return where, lines
-
-    # цена между зонами
-    d_res = (r0["lo"] - px) / a1 if r0 else None
-    d_sup = (px - s0["hi"]) / a1 if s0 else None
-    where = "📍 Цена <b>между зонами</b>"
-    if r0 and s0:
-        where += f": до сопротивления {S.pct(r0['lo'], px):+.2f}%, до поддержки {S.pct(s0['hi'], px):+.2f}%"
-    lines.append("🚫 Посередине вход плохой: стоп далеко, а цель близко.")
-    if tr == "down":
-        if r0:
-            lines.append(f"⏳ Жди отката вверх к сопротивлению <b>{fmt_zone(r0)}</b> и отказа там → шорт.")
-        if s0 and d_sup is not None and d_res is not None and d_sup < d_res:
-            lines.append(f"⚠️ Поддержка {price(s0['hi'])} близко — шортить сюда поздно, а покупать — против тренда.")
-    elif tr == "up":
-        if s0:
-            lines.append(f"⏳ Жди отката вниз к поддержке <b>{fmt_zone(s0)}</b> и отскока там → лонг.")
-        if r0 and d_sup is not None and d_res is not None and d_res < d_sup:
-            lines.append(f"⚠️ Сопротивление {price(r0['lo'])} близко — покупать сюда поздно, а шортить — против тренда.")
-    else:
-        if r0:
-            lines.append(f"⏳ Шорт — только от {fmt_zone(r0)}")
-        if s0:
-            lines.append(f"⏳ Лонг — только от {fmt_zone(s0)}")
-    return where, lines
-
-
 # ================================================================ Star / Hammer: рабочая или ложная
 
 def _zone_hit(lo, hi, zones):
-    return next((z for z in zones if lo <= z["hi"] and hi >= z["lo"]), None)
+    return next((z for z in zones if z and lo <= z["hi"] and hi >= z["lo"]), None)
 
 
 def pattern_check(c1, tr, res, sup, at, a1):
-    """Последняя Star/Hammer на 1ч (за PATTERN_LOOKBACK_1H свечей): рабочая или ложная, и почему."""
+    """Последняя Star/Hammer на 1ч. Возвращает (строки, info) или ([], None).
+    info: kind 'star'/'hammer', status 'ok'/'wait'/'doubt'/'false', trigger — цена закрытия для подтверждения."""
     n = len(c1)
     rsi = S.rsi_series([x["c"] for x in c1])
     for back in range(A.PATTERN_LOOKBACK_1H):
@@ -197,91 +118,184 @@ def pattern_check(c1, tr, res, sup, at, a1):
         star, ham = S.is_star(c1, i, 10), S.is_hammer(c1, i)
         if not (star or ham):
             continue
-        x = c1[i]
-        nxt = c1[i + 1:]
+        x, nxt = c1[i], c1[i + 1:]
         plus, minus = [], []
         if star:
-            name = "🌠 Star"
-            if tr == "down":
-                plus.append("по тренду (тренд вниз)")
-            elif tr == "up":
-                minus.append("против тренда вверх — в росте звёзды часто ложные")
-            if _zone_hit(x["l"], x["h"], res + ([at] if at else [])):
-                plus.append("у сопротивления")
-            elif _zone_hit(x["l"], x["h"], sup):
-                minus.append("у поддержки — отсюда цена скорее отскочит вверх")
-            else:
-                minus.append("не у уровня, посередине")
-            if rsi[i] is not None:
-                (plus if rsi[i] >= 55 else minus).append(f"RSI {rsi[i]:.0f} " + ("— рост выдыхается" if rsi[i] >= 55 else "— рост ещё не был сильным"))
-            if not nxt:
-                confirm = "⏳ подтверждения ещё нет: жди закрытие следующей свечи ниже " + price(x["l"])
-            elif min(y["c"] for y in nxt) < x["l"]:
-                plus.append("подтверждена: закрытие ниже её минимума")
-                confirm = None
-            elif max(y["c"] for y in nxt) > x["h"]:
-                minus.append("сломана: свеча закрылась выше её максимума")
-                confirm = None
-            else:
-                confirm = "⏳ подтверждения ещё нет: жди закрытие свечи ниже " + price(x["l"])
+            want, against, lvl_ok, lvl_bad = "down", "up", res + [at], sup
+            trig, stop_side = x["l"], x["h"]
+            rsi_ok = rsi[i] is not None and rsi[i] >= 55
         else:
-            name = "🔨 Hammer"
-            if tr == "up":
-                plus.append("по тренду (тренд вверх)")
-            elif tr == "down":
-                minus.append("против тренда вниз — в падении молоты часто ложные")
-            if _zone_hit(x["l"], x["h"], sup + ([at] if at else [])):
-                plus.append("у поддержки")
-            elif _zone_hit(x["l"], x["h"], res):
-                minus.append("у сопротивления — отсюда цена скорее пойдёт вниз")
+            want, against, lvl_ok, lvl_bad = "up", "down", sup + [at], res
+            trig, stop_side = x["h"], x["l"]
+            rsi_ok = rsi[i] is not None and rsi[i] <= 45
+        if tr == want:
+            plus.append("по тренду")
+        elif tr == against:
+            minus.append("против тренда — такие часто ложные")
+        if _zone_hit(x["l"], x["h"], lvl_ok):
+            plus.append("у уровня")
+        elif _zone_hit(x["l"], x["h"], lvl_bad):
+            minus.append("не у того уровня (" + ("у поддержки" if star else "у сопротивления") + ")")
+        else:
+            minus.append("посередине, не у уровня")
+        if rsi[i] is not None:
+            if rsi_ok:
+                plus.append(f"RSI {rsi[i]:.0f} — движение выдыхается")
             else:
-                minus.append("не у уровня, посередине")
-            if rsi[i] is not None:
-                (plus if rsi[i] <= 45 else minus).append(f"RSI {rsi[i]:.0f} " + ("— падение выдыхается" if rsi[i] <= 45 else "— падения почти не было"))
-            if not nxt:
-                confirm = "⏳ подтверждения ещё нет: жди закрытие следующей свечи выше " + price(x["h"])
-            elif max(y["c"] for y in nxt) > x["h"]:
-                plus.append("подтверждён: закрытие выше его максимума")
-                confirm = None
-            elif min(y["c"] for y in nxt) < x["l"]:
-                minus.append("сломан: свеча закрылась ниже его минимума")
-                confirm = None
-            else:
-                confirm = "⏳ подтверждения ещё нет: жди закрытие свечи выше " + price(x["h"])
+                minus.append(f"RSI {rsi[i]:.0f} — " + ("роста перед ней почти не было" if star else "падения перед ним почти не было"))
         if (x["h"] - x["l"]) < 0.6 * a1:
-            minus.append("свеча маленькая (меньше обычного размаха) — слабый сигнал")
-        broken = any("сломан" in t for t in minus)
+            minus.append("свеча маленькая")
+        closes = [y["c"] for y in nxt]
+        confirmed = bool(closes) and (min(closes) < trig if star else max(closes) > trig)
+        broken = bool(closes) and (max(closes) > stop_side if star else min(closes) < stop_side)
+        if broken:
+            minus.append("сломана: свеча закрылась за её " + ("максимумом" if star else "минимумом"))
+        elif confirmed:
+            plus.append("подтверждена закрытием свечи")
         if broken or len(minus) >= 2:
-            verdict = "❌ <b>скорее ложная</b>" if star else "❌ <b>скорее ложный</b>"
-        elif not minus and confirm is None:
-            verdict = "✅ <b>рабочая</b>" if star else "✅ <b>рабочий</b>"
+            status = "false"
+        elif confirmed and not minus:
+            status = "ok"
+        elif not minus:
+            status = "wait"
         else:
-            verdict = "⚠️ <b>сомнительная</b>" if star else "⚠️ <b>сомнительный</b>"
-        ago = "на последней свече" if back == 0 else f"{back + 1} свеч. назад"
-        out = [f"{name} на 1ч ({ago}): {verdict}"]
-        out += [f"   ✓ {t}" for t in plus] + [f"   ✗ {t}" for t in minus]
-        if confirm and not broken:
-            out.append(f"   {confirm}")
-        return out
-    return []
+            status = "doubt"
+        title = {"false": "❌ скорее ЛОЖНАЯ", "ok": "✅ рабочая, подтверждена",
+                 "wait": "⏳ хорошая, но ждёт подтверждения", "doubt": "⚠️ сомнительная"}[status]
+        name = "Star 🌠" if star else "Hammer 🔨"
+        ago = "последняя свеча" if back == 0 else f"{back + 1} свеч. назад"
+        lines = [f"{name} на 1ч ({ago}): <b>{title}</b>"]
+        lines += [f"   ✓ {t}" for t in plus] + [f"   ✗ {t}" for t in minus]
+        if status in ("wait", "doubt") and not confirmed:
+            lines.append(f"   подтверждение: закрытие свечи {'ниже' if star else 'выше'} {price(trig)}")
+        return lines, {"kind": "star" if star else "hammer", "status": status,
+                       "trigger": None if confirmed or broken else trig, "extreme": stop_side}
+    return [], None
+
+
+# ================================================================ Один вывод: что делать сейчас
+
+def _plan(side, entry, stop_edge, target_zone, a1):
+    """Стоп за уровнем с запасом, цель у следующей зоны, плечо ≈ 50 / стоп%."""
+    buf = A.ZONE_STOP_BUFFER_ATR1 * a1
+    stop = stop_edge + buf if side == "short" else stop_edge - buf
+    r = abs(stop - entry)
+    if target_zone:
+        tgt = target_zone["hi"] + 0.1 * a1 if side == "short" else target_zone["lo"] - 0.1 * a1
+    else:
+        tgt = entry - 2 * r if side == "short" else entry + 2 * r
+    stop_pct = r / entry * 100
+    rr = abs(tgt - entry) / r if r else 0
+    return {"side": side, "entry": entry, "stop": stop, "target": tgt, "rr": rr,
+            "lev": max(1, min(A.MAX_LEV_HINT, int(A.LIQ_SAFETY_PCT / stop_pct))) if stop_pct else None}
+
+
+def _fmt_plan(p):
+    e = p["entry"]
+    s = (f"   стоп {price(p['stop'])} ({S.pct(p['stop'], e):+.1f}%) · цель {price(p['target'])} "
+         f"({S.pct(p['target'], e):+.1f}%) · плечо до x{p['lev']}")
+    if p["rr"] < A.MIN_RR_ZONES:
+        s += f"\n   ⚠️ прибыль всего {p['rr']:.1f}× от риска — слабая сделка, лучше пропустить"
+    return s
+
+
+def decide(px, tr, res, sup, at, a1, c1, pat):
+    """Возвращает строки: вывод, почему, при каком условии вход, отмена."""
+    last = c1[-1]
+    r0, s0 = (res[0] if res else None), (sup[0] if sup else None)
+    side = {"down": "short", "up": "long"}.get(tr)
+    word = {"short": "ШОРТ", "long": "ЛОНГ"}
+    trend_line = {"down": "Тренд вниз → ищем только шорт.", "up": "Тренд вверх → ищем только лонг.",
+                  "range": "Тренда нет (боковик) → шорт только от верхней зоны, лонг только от нижней."}[tr]
+    pat_ok = pat if pat and pat["status"] != "false" and ((pat["kind"] == "star") == (side == "short")) else None
+
+    def out(head, why, cond=None, plan=None, cancel=None):
+        lines = [head, trend_line] + why
+        if cond:
+            lines += ["", cond]
+        if plan:
+            lines.append(_fmt_plan(plan))
+        if cancel:
+            lines.append(cancel)
+        return lines
+
+    if side is None:  # боковик
+        why = ["Цена " + (f"в зоне {price(at['lo'])}–{price(at['hi'])}." if at else "посередине.")]
+        cond = []
+        if r0:
+            cond.append(f"▶️ Шорт — только у {price(r0['lo'])}–{price(r0['hi'])} после свечи-отказа")
+        if s0:
+            cond.append(f"▶️ Лонг — только у {price(s0['lo'])}–{price(s0['hi'])} после свечи-отскока")
+        return out("⏳ <b>СЕЙЧАС: НЕ ВХОДИТЬ — ждать</b>", why, "\n".join(cond) or None)
+
+    short = side == "short"
+    fwd = s0 if short else r0  # куда идём (цель)
+    back = r0 if short else s0  # откуда ждём вход
+
+    if at:
+        z = at
+        kind = candle_vs_zone(last, z)
+        zone_txt = f"{price(z['lo'])}–{price(z['hi'])}"
+        if kind == ("fake_up" if short else "fake_down"):
+            plan = _plan(side, px, last["h"] if short else last["l"], fwd, a1)
+            return out(f"✅ <b>СЕЙЧАС: МОЖНО {word[side]}</b>",
+                       [f"Ложный пробой зоны {zone_txt}: цену вынесло {'вверх' if short else 'вниз'} и вернуло обратно — "
+                        "это ловушка для тех, кто вошёл против тренда."],
+                       f"▶️ {word[side]} от {price(px)}", plan,
+                       f"❌ Отмена: закрытие 1ч {'выше' if short else 'ниже'} {price(plan['stop'])}")
+        if pat_ok and pat_ok["status"] == "ok":
+            plan = _plan(side, px, max(z["hi"], pat_ok["extreme"]) if short else min(z["lo"], pat_ok["extreme"]), fwd, a1)
+            return out(f"✅ <b>СЕЙЧАС: МОЖНО {word[side]}</b>",
+                       [f"Цена в зоне {zone_txt}, {'Star' if short else 'Hammer'} подтверждена."],
+                       f"▶️ {word[side]} от {price(px)}", plan,
+                       f"❌ Отмена: закрытие 1ч {'выше' if short else 'ниже'} {price(plan['stop'])}")
+        if kind == ("break_down" if short else "break_up"):
+            edge = z["lo"] if short else z["hi"]
+            plan = _plan(side, edge, z["hi"] if short else z["lo"], fwd, a1)
+            return out("⏳ <b>СЕЙЧАС: НЕ ДОГОНЯТЬ — ждать ретест</b>",
+                       [f"Свеча 1ч закрылась {'под' if short else 'над'} зоной {zone_txt} — пробой по тренду."],
+                       f"▶️ {word[side]}, если цена вернётся к {price(edge)} и не закрепится обратно", plan)
+        # ждём сигнал у зоны
+        why = [f"Цена в зоне {zone_txt} — здесь уже были развороты."]
+        if kind == ("fake_down" if short else "fake_up"):
+            why.append(f"Последнюю свечу выносило {'вниз' if short else 'вверх'} и вернуло — уровень пока держат "
+                       f"{'покупатели' if short else 'продавцы'}. {'Покупать' if short else 'Шортить'} против тренда не стоит.")
+        if pat_ok and pat_ok["trigger"]:
+            trig = pat_ok["trigger"]
+            why.append(f"Есть {'Star' if short else 'Hammer'}, но она ещё не подтверждена.")
+        else:
+            trig = z["lo"] if short else z["hi"]
+            why.append("Сигнала на вход (свечи-разворота) ещё нет.")
+        plan = _plan(side, trig, max(z["hi"], last["h"]) if short else min(z["lo"], last["l"]), fwd, a1)
+        return out("⏳ <b>СЕЙЧАС: НЕ ВХОДИТЬ — ждать сигнал</b>", why,
+                   f"▶️ {word[side]}, если свеча 1ч закроется {'ниже' if short else 'выше'} {price(trig)}", plan,
+                   f"❌ Отмена: закрытие 1ч {'выше' if short else 'ниже'} {price(plan['stop'])}")
+
+    # между зонами
+    why = ["Цена посередине между уровнями: стоп будет далеко, а цель близко."]
+    if back:
+        edge = back["lo"] if short else back["hi"]
+        plan = _plan(side, edge, back["hi"] if short else back["lo"], fwd, a1)
+        return out("🚫 <b>СЕЙЧАС: НЕ ВХОДИТЬ</b>", why,
+                   f"▶️ Ждать {'отката вверх' if short else 'отката вниз'} к зоне {price(back['lo'])}–{price(back['hi'])}, "
+                   f"там — свечу-{'отказ' if short else 'отскок'} → {word[side]}", plan)
+    return out("🚫 <b>СЕЙЧАС: НЕ ВХОДИТЬ</b>", why + ["Уровня для входа рядом нет."])
 
 
 def report(m):
-    """Блок для разбора монеты: тренд, зоны, где цена и что ждать. Возвращает (строки, данные для графика)."""
+    """(главный вывод, подробности, данные для графика)."""
     c1, c4, px = m["c1"], m["c4"], m["px"]
     tr = trend(c4)
     res, sup, at, a1 = find_zones(c1, c4, px)
-    where, todo = situation(px, tr, res, sup, at, a1, c1)
-    lines = [f"Тренд 4ч: {TREND_TEXT[tr]}", "",
-             "🔴 Сопротивления выше:" + ("" if res else " нет")]
-    lines += [f"   {fmt_zone(z)}" for z in res]
-    lines.append("🟢 Поддержки ниже:" + ("" if sup else " нет"))
-    lines += [f"   {fmt_zone(z)}" for z in sup]
-    lines += ["", where] + todo
-    pat = pattern_check(c1, tr, res, sup, at, a1)
-    if pat:
-        lines += [""] + pat
-    return lines, {"trend": tr, "res": res, "sup": sup, "at": at}
+    plines, pat = pattern_check(c1, tr, res, sup, at, a1)
+    main = decide(px, tr, res, sup, at, a1, c1, pat)
+    det = ["🔴 Сопротивления выше: " + ("; ".join(fmt_zone(z) for z in res) or "нет")]
+    if at:
+        det.append(f"🟡 Цена сейчас в зоне: {fmt_zone(at)}")
+    det.append("🟢 Поддержки ниже: " + ("; ".join(fmt_zone(z) for z in sup) or "нет"))
+    if plines:
+        det += [""] + plines
+    return main, det, {"trend": tr, "res": res, "sup": sup, "at": at}
 
 
 # ================================================================ Картинка
