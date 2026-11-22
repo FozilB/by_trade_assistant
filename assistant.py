@@ -25,6 +25,7 @@ import requests
 
 import assistant_config as A
 import shortsetup as S
+import zones as Z
 
 C = S.C
 H1, M15, M1 = S.H1, S.M15, 60_000
@@ -60,6 +61,24 @@ def tg(method, payload, timeout=30):
         log(f"  Telegram {method}: {j.get('error_code')} {j.get('description')}")
         return None
     return j.get("result")
+
+
+def tg_file(method, data, files, timeout=60):
+    try:
+        r = requests.post(f"https://api.telegram.org/bot{TOKEN}/{method}", data=data, files=files, timeout=timeout)
+        j = r.json()
+    except (requests.RequestException, ValueError) as e:
+        log(f"  Telegram {method}: ошибка {e}")
+        return None
+    if not j.get("ok"):
+        log(f"  Telegram {method}: {j.get('error_code')} {j.get('description')}")
+        return None
+    return j.get("result")
+
+
+def send_photo(png, caption=""):
+    data = {"chat_id": CHAT, "caption": caption, "parse_mode": "HTML"}
+    return tg_file("sendPhoto", data, {"photo": ("chart.png", png, "image/png")}) is not None
 
 
 def say(text, markup=None):
@@ -367,43 +386,42 @@ def fmt_plan(p, m=None):
     return "\n".join(lines)
 
 
-def analyze(inst):
-    m = load_market(inst)
+def analyze(inst, m=None):
+    m = m or load_market(inst)
     px = m["px"]
     b = S.base_of(inst)
     c4, c1 = m["c4"], m["c1"]
-    sma = S.sma_last([x["c"] for x in c4], 50)
-    h4, l4 = S.pivots(c4[-100:], 3)
     rsi1 = S.rsi_series([x["c"] for x in c1])[-1]
     rsi4 = S.rsi_series([x["c"] for x in c4])[-1]
-    hh = [p for _, p in h4[-3:]]
-    if len(hh) >= 2:
-        trend = "вниз (максимумы снижаются)" if hh[-1] < hh[-2] else "вверх (максимумы растут)"
-    else:
-        trend = "не определён"
-    res = sorted({p for _, p in S.pivots(c1[-120:], 3)[0] + h4 if p > px})[:2]
-    sup = levels("short", px, m)[:2]
-    lines = [f"🔍 <b>{b}</b> · цена {price(px)}", "",
-             f"4ч: тренд {trend}, цена {'ниже' if sma and px < sma else 'выше'} средней линии ({price(sma) if sma else '—'})",
-             f"RSI: 1ч {rsi1:.0f} · 4ч {rsi4:.0f}" if rsi1 and rsi4 else "RSI: —",
-             "Сопротивления выше: " + (", ".join(price(x) for x in res) or "нет"),
-             "Поддержки ниже: " + (", ".join(price(x) for x in sup) or "нет")]
-    if any(S.is_hammer(c1, len(c1) - 1 - j) for j in range(3)):
-        lines.append("⚠️ Свежий Hammer на 1ч")
-    if any(S.is_star(c1, len(c1) - 1 - j, 10) for j in range(3)):
-        lines.append("🌠 Свежая Star на 1ч")
-    kind, d = S.detect(c4, c1, px, m["c15"])
-    if kind == "signal":
-        lines += ["", "✅ <b>Сейчас есть сетап «шорт от нижнего максимума»</b>"]
-    elif kind == "watch":
-        lines += ["", f"👀 Цена у сопротивления {price(d['level'][1])} — ждать свечу-разворот на 1ч"]
-    else:
-        lines += ["", f"⛔ Для шорта сейчас не подходит: {plain_reason(d)}"]
-    p = make_plan(inst, "short", px, None, None, None, m)
-    lines += ["", f"Если шорт отсюда: стоп {price(p['stop'])} ({S.pct(p['stop'], px):+.2f}%), "
-                  f"цель 1 {price(p['t1'])} ({S.pct(p['t1'], px):+.2f}%)",
+    zlines, z = Z.report(m)
+    lines = [f"🔍 <b>{b}</b> · цена {price(px)}",
+             f"RSI: 1ч {rsi1:.0f} · 4ч {rsi4:.0f}" if rsi1 and rsi4 else "RSI: —", ""] + zlines
+    if z["trend"] != "up":
+        kind, d = S.detect(c4, c1, px, m["c15"])
+        if kind == "signal":
+            lines += ["", "✅ <b>Сейчас есть сетап «шорт от нижнего максимума»</b>"]
+        elif kind == "watch":
+            lines += ["", f"👀 Сетап сканера: цена у сопротивления {price(d['level'][1])} — ждать свечу-разворот на 1ч"]
+        else:
+            lines += ["", f"⛔ Сетап сканера для шорта: нет — {plain_reason(d)}"]
+    side = "long" if z["trend"] == "up" else "short"
+    p = make_plan(inst, side, px, None, None, None, m)
+    lines += ["", f"Если {'лонг' if side == 'long' else 'шорт'} прямо отсюда: стоп {price(p['stop'])} "
+                  f"({S.pct(p['stop'], px):+.2f}%), цель 1 {price(p['t1'])} ({S.pct(p['t1'], px):+.2f}%)",
               f"<a href=\"{S.chart_link(inst)}\">График TradingView</a>"]
-    return "\n".join(lines)
+    return "\n".join(lines), z
+
+
+def cmd_analyze(inst):
+    """Разбор монеты по запросу: картинка с зонами и текст."""
+    m = load_market(inst)
+    text, z = analyze(inst, m)
+    try:
+        png = Z.chart_png(m["c1"], m["px"], z, f"{S.base_of(inst)} · 1ч · зоны поддержки и сопротивления")
+        send_photo(png)
+    except Exception as e:  # картинка не должна ломать разбор
+        log(f"  График не построен: {e}")
+    return say(text)
 
 
 # ================================================================ Позиции
@@ -747,10 +765,10 @@ def handle_text(state, text):
         return say(HELP, menu_markup())
     if cmd in ("/in", "in", "/вход", "вход"):
         return cmd_in(state, parse_in(args))
-    if cmd in ("/analyze", "/a", "/анализ", "анализ"):
+    if cmd in ("/analyze", "/a", "/анализ", "анализ", "/levels", "/уровни", "уровни"):
         if not args:
             raise ValueError("какую монету? Например: /analyze aero")
-        return say(analyze(norm_inst(args[0])))
+        return cmd_analyze(norm_inst(args[0]))
     if cmd in ("/status", "/s", "статус"):
         return cmd_status(state, find_pos(state, args[0]) if args else None)
     if cmd in ("/stop", "/sl", "стоп"):
@@ -779,14 +797,14 @@ def handle_text(state, text):
         px = num(args[1]) if len(args) > 1 else last_price(inst)
         return close_pos(state, inst, px, "по вашей команде")
     if len(parts) == 1 and re.fullmatch(r"[A-Za-z0-9.\-/]{2,25}", t):  # просто название монеты — анализ
-        return say(analyze(norm_inst(t)))
+        return cmd_analyze(norm_inst(t))
     say("Не понял команду.\n\n" + HELP, menu_markup())
 
 
 def handle_webapp(state, data):
     d = json.loads(data)
     if d.get("mode") == "analyze":
-        return say(analyze(norm_inst(d["sym"])))
+        return cmd_analyze(norm_inst(d["sym"]))
     d = {"sym": d["sym"], "side": d.get("side") or "short", "entry": num(d["entry"]),
          "lev": num(d["lev"]) if d.get("lev") else None, "margin": num(d["margin"]) if d.get("margin") else None,
          "stop": num(d["stop"]) if d.get("stop") else None}
