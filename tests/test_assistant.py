@@ -71,9 +71,11 @@ def env(tmp_path, monkeypatch):
             return {"message_id": len(sent)}
         return True
     monkeypatch.setattr(AS, "tg", fake_tg)
+    photos = []
+    monkeypatch.setattr(AS, "tg_file", lambda method, data, files, timeout=60: photos.append(files["photo"][1]) or True)
     clock = {"t": mk.c1[-1]["ts"] + H1 + 30_000}
     monkeypatch.setattr(AS, "now_ms", lambda: clock["t"])
-    return {"sent": sent, "mk": mk, "clock": clock, "state": AS.load_state()}
+    return {"sent": sent, "mk": mk, "clock": clock, "state": AS.load_state(), "photos": photos}
 
 
 # ---------------------------------------------------------------- разбор ввода
@@ -351,3 +353,50 @@ def test_hist_keeps_open_time(env):
     opened = st["pos"]["AERO-USDT-SWAP"]["opened"]
     AS.handle_text(st, "/out aero 0.79")
     assert st["hist"][-1]["opened"] == opened
+
+
+# ---------------------------------------------------------------- зоны, график, Star/Hammer
+
+import zones as Z  # noqa: E402
+
+
+def test_analyze_sends_chart_and_zones(env):
+    AS.handle_text(env["state"], "/levels aero")
+    assert env["photos"] and env["photos"][-1][:8] == b"\x89PNG\r\n\x1a\n"
+    text = env["sent"][-1]
+    assert "Тренд 4ч" in text and "Сопротивления" in text and "📍" in text
+
+
+def test_zones_are_ranges_around_turns(env):
+    m = AS.load_market("AERO-USDT-SWAP")
+    res, sup, at, a1 = Z.find_zones(m["c1"], m["c4"], m["px"])
+    for z in res:
+        assert z["lo"] > m["px"] and z["hi"] > z["lo"]
+    for z in sup:
+        assert z["hi"] < m["px"]
+    assert res or sup
+
+
+def _candle(o, h, l, c, ts=0):
+    return {"ts": ts, "o": o, "h": h, "l": l, "c": c, "v": 1, "closed": True}
+
+
+def test_hammer_in_downtrend_mid_air_is_false():
+    cs = [_candle(10 - i * 0.1, 10 - i * 0.1 + 0.05, 10 - i * 0.1 - 0.15, 10 - i * 0.1 - 0.1, i) for i in range(30)]
+    last = cs[-1]["c"]
+    cs.append(_candle(last, last + 0.02, last - 0.5, last + 0.01, 30))  # длинная нижняя тень
+    assert S.is_hammer(cs, len(cs) - 1)
+    out = Z.pattern_check(cs, "down", [], [], None, 0.15)
+    assert out and "ложн" in out[0] and any("против тренда" in x for x in out)
+
+
+def test_star_at_resistance_confirmed_is_working():
+    cs = [_candle(10 + i * 0.05, 10 + i * 0.05 + 0.08, 10 + i * 0.05 - 0.03, 10 + i * 0.05 + 0.05, i) for i in range(30)]
+    last = cs[-1]["c"]
+    cs.append(_candle(last, last + 0.9, last - 0.02, last - 0.01, 30))  # длинная верхняя тень
+    cs.append(_candle(last - 0.01, last, last - 0.4, last - 0.3, 31))  # закрытие ниже минимума звезды
+    i = len(cs) - 2
+    assert S.is_star(cs, i, 10)
+    zone = {"lo": last + 0.3, "hi": last + 0.95, "touches": 3, "h4": True}
+    out = Z.pattern_check(cs, "down", [zone], [], None, 0.3)
+    assert out and "рабоч" in out[0]
